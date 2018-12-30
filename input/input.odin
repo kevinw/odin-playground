@@ -206,6 +206,7 @@ run :: proc() -> int {
 
         mvp := math.mul(math.mul(projection, view), model);
 
+
         gl.Clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
 
         gl.UseProgram(program);
@@ -239,6 +240,7 @@ run :: proc() -> int {
 
         glfw.swap_buffers(window);
         glfw.poll_events();
+        glfw.calculate_frame_timings(window);
 
         updated := false;
         program, last_vertex_time, last_fragment_time, updated = gl.update_shader_if_changed(vertex_name, fragment_name, program, last_vertex_time, last_fragment_time);
