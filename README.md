@@ -2,6 +2,12 @@
 
 Gamedev experiments in [Odin](https://odin.handmade.network/).
 
+### Prerequisites
+
+* [Odin](https://odin.handmade.network/).
+* [odin-gl](https://github.com/vassvik/odin-gl) installed to your Odin "shared" library collection
+* [odin-glfw](https://github.com/vassvik/odin-glfw) installed to your Odin "shared" library collection
+
 ## [triangle](triangle/triangle.odin)
 
 ![A red triangle](docs/screenshots/triangle.png)
