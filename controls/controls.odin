@@ -13,6 +13,8 @@ FlyCam :: struct {
     direction: Vec3,
     right: Vec3,
     up: Vec3,
+
+    enabled: bool,
 }
 
 new_flycam :: proc() -> FlyCam {
@@ -20,6 +22,7 @@ new_flycam :: proc() -> FlyCam {
         position = math.Vec3{ 0, 0, 5 },
         horizontal_angle = 3.1,
         vertical_angle = 0,
+        enabled = true,
     };
 }
 
@@ -35,6 +38,8 @@ update_flycam :: proc(window: glfw.Window_Handle, using flycam: ^FlyCam, delta_t
     // if not focused, don't fly around
     if 0 == glfw.get_window_attrib(window, glfw.FOCUSED) do return;
 
+    if !enabled do return;
+
     window_w, window_h := glfw.get_window_size(window);
     center_x := cast(f64)window_w / cast(f64)2;
     center_y := cast(f64)window_h / cast(f64)2;
@@ -42,9 +47,10 @@ update_flycam :: proc(window: glfw.Window_Handle, using flycam: ^FlyCam, delta_t
     initial_fov:f32 = 45;
 
     speed:f32 = 3;
-    mouse_speed:f32 = 0.05;
+    mouse_speed:f32 = 1.0;
 
     xpos, ypos := glfw.get_cursor_pos(window);
+
     glfw.set_cursor_pos(window, auto_cast center_x, auto_cast center_y);
 
     horizontal_angle += mouse_speed * delta_time * cast(f32)(center_x - xpos);
@@ -69,8 +75,15 @@ update_flycam :: proc(window: glfw.Window_Handle, using flycam: ^FlyCam, delta_t
     left_pressed := glfw.get_key(window, glfw.KEY_LEFT) || glfw.get_key(window, glfw.KEY_A);
     right_pressed := glfw.get_key(window, glfw.KEY_RIGHT) || glfw.get_key(window, glfw.KEY_D);
 
+    raise_pressed := glfw.get_key(window, glfw.KEY_E);
+    crouch_pressed := glfw.get_key(window, glfw.KEY_C);
+
     if up_pressed do position += direction * delta_time * speed;
     if down_pressed do position -= direction * delta_time * speed;
+
     if right_pressed do position += right * delta_time * speed;
     if left_pressed do position -= right * delta_time * speed;
+
+    if raise_pressed do position += up * delta_time * speed;
+    if crouch_pressed do position -= up * delta_time * speed;
 }

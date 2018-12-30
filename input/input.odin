@@ -19,12 +19,16 @@ WINDOW_TITLE := "input";
 GL_VERSION_MAJOR :: 4;
 GL_VERSION_MINOR :: 3;
 
+flycam := controls.new_flycam();
+
 key_callback :: proc "c" (window: glfw.Window_Handle, key: i32, scancode: i32, action: i32, mods: i32) {
     if action != i32(glfw.PRESS) do return;
 
     if key == i32(glfw.KEY_ESCAPE) || key == i32(glfw.KEY_Q) {
         glfw.set_window_should_close(window, true);
     }
+
+    if key == i32(glfw.KEY_SPACE) do flycam.enabled = !flycam.enabled;
 }
 
 run :: proc() -> int {
@@ -48,6 +52,7 @@ run :: proc() -> int {
     }
 
     glfw.set_key_callback(window, key_callback);
+    glfw.set_input_mode(window, glfw.CURSOR, auto_cast glfw.CURSOR_DISABLED);
 
     vertex_name :: "input/shaders/vert.glsl";
     fragment_name :: "input/shaders/frag.glsl";
@@ -187,24 +192,17 @@ run :: proc() -> int {
 
     last_time := glfw.get_time();
 
-    flycam := controls.new_flycam();
 
     view := math.Mat4 {};
+
+    gl.Enable(gl.CULL_FACE);
 
     for !glfw.window_should_close(window) {
         current_time := glfw.get_time();
         delta_time := cast(f32)(current_time - last_time);
 
         controls.update_flycam(window, &flycam, delta_time);
-
         controls.flycam_view_matrix(&flycam, &view);
-        /*
-        view = math.look_at(
-            math.Vec3{4, 3, 3}, // eye
-            math.Vec3{0, 0, 0}, // center (target to look at)
-            math.Vec3{0, 1, 0}, // up
-        );
-        */
 
         mvp := math.mul(math.mul(projection, view), model);
 
