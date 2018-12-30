@@ -1,8 +1,8 @@
 package main
 
-import "triangle"
+import main_pkg "cube"
 
 main :: proc() {
-    ret_code := triangle.run(); // TODO: exit with error code   
+    ret_code := main_pkg.run(); // TODO: exit with error code   
 }
 
