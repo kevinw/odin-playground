@@ -38,3 +38,9 @@ New prerequisite: [stb_image](https://github.com/vassvik/odin-stb/blob/master/st
 
 Loading an image with `stb_image` and drawing a textured cube.
 
+## [input](input/input.odin)
+
+![A poorly-culled cube from a perspective camera](docs/screenshots/input.png)
+
+Flying around with WASD and the mouse.
+
