@@ -5,10 +5,8 @@ import "../glutil"
 import "shared:odin-glfw"
 import "shared:odin-gl"
 
-import "core:mem"
 import "core:fmt"
 import "core:math";
-import "core:strings"
 
 RES_X := 1280;
 RES_Y := 720;
