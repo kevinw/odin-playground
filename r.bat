@@ -1,3 +1,3 @@
 @setlocal
 
-@odin run main.odin
+@..\odin\odin run main.odin -vet
