@@ -1,7 +1,7 @@
 package input
 
 import "../glutil"
-import "../controls"
+import "controls"
 
 import "shared:odin-glfw"
 import "shared:odin-gl"
