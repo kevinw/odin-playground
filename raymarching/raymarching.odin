@@ -15,9 +15,38 @@ RES_X := 1280;
 RES_Y := 720;
 WINDOW_TITLE := "raymarching";
 GL_VERSION_MAJOR :: 4;
-GL_VERSION_MINOR :: 3;
+GL_VERSION_MINOR :: 5;
 
 flycam := camera.FlyControls {};
+
+Shader :: struct {
+    id: u32,
+    last_vertex_time: os.File_Time,
+    last_fragment_time: os.File_Time,
+    vertex_filename: string,
+    fragment_filename: string,
+}
+
+Shader_init :: proc(
+    program: ^Shader,
+    vertex_filename: string,
+    fragment_filename: string,
+) -> bool {
+    program.vertex_filename = vertex_filename;
+    program.fragment_filename = fragment_filename;
+    return Shader_update_if_changed(program);
+}
+
+Shader_update_if_changed :: proc(
+    using program: ^Shader,
+) -> bool {
+    shaders_updated := false;
+    id, last_vertex_time, last_fragment_time, shaders_updated = 
+        gl.update_shader_if_changed(
+            vertex_filename, fragment_filename, id, last_vertex_time, last_fragment_time);
+
+    return shaders_updated;
+}
 
 key_callback :: proc "c" (window: glfw.Window_Handle, key: i32, scancode: i32, action: i32, mods: i32) {
     if action != i32(glfw.PRESS) do return;
@@ -57,32 +86,123 @@ run :: proc() -> int {
     vertex_name := fmt.tprint(path.dir_name(#file), "/shaders/vert.glsl");
     fragment_name := fmt.tprint(path.dir_name(#file), "/shaders/frag.glsl");
 
-    last_vertex_time := os.File_Time(0);
-    last_fragment_time := os.File_Time(0);
-    shaders_updated := false;
-    program :u32 = 0;
-
-    program, last_vertex_time, last_fragment_time, shaders_updated = gl.update_shader_if_changed(vertex_name, fragment_name, 0, os.File_Time(0), os.File_Time(0));
-    if !shaders_updated {
-        fmt.println("error: cannot load shaders");
+    program : Shader;
+    success := Shader_init(&program, vertex_name, fragment_name);
+    if !success {
+        fmt.println("error: cannot load raymarching shaders");
         return -1;
     }
+
+    cube_program : Shader;
+    success2 := Shader_init(&cube_program, "cube/shaders/vert.glsl", "cube/shaders/frag.glsl");
+    if !success2 {
+        fmt.println("error: cannot load cube shaders");
+        return -1;
+    }
+
+    // set clip space Z range to [0, 1], not [-1, +1]
+    // thanks https://nlguillemot.wordpress.com/2016/12/07/reversed-z-in-opengl/
+    //gl.ClipControl(gl.LOWER_LEFT, gl.ZERO_TO_ONE); 
 
     // Array object. needed to draw elements
     vertex_array_id : u32 = ---;
     gl.GenVertexArrays(1, &vertex_array_id);
     gl.BindVertexArray(vertex_array_id);
 
+    // Our vertices. Three consecutive floats give a 3D vertex; Three consecutive vertices give a triangle.
+    // A cube has 6 faces with 2 triangles each, so this makes 6*2=12 triangles, and 12*3 vertices
+    vertex_buffer_data := []f32 {
+        -1.0,-1.0,-1.0, // triangle 1 : begin
+        -1.0,-1.0, 1.0,
+        -1.0, 1.0, 1.0, // triangle 1 : end
+        1.0, 1.0,-1.0, // triangle 2 : begin
+        -1.0,-1.0,-1.0,
+        -1.0, 1.0,-1.0, // triangle 2 : end
+        1.0,-1.0, 1.0,
+        -1.0,-1.0,-1.0,
+        1.0,-1.0,-1.0,
+        1.0, 1.0,-1.0,
+        1.0,-1.0,-1.0,
+        -1.0,-1.0,-1.0,
+        -1.0,-1.0,-1.0,
+        -1.0, 1.0, 1.0,
+        -1.0, 1.0,-1.0,
+        1.0,-1.0, 1.0,
+        -1.0,-1.0, 1.0,
+        -1.0,-1.0,-1.0,
+        -1.0, 1.0, 1.0,
+        -1.0,-1.0, 1.0,
+        1.0,-1.0, 1.0,
+        1.0, 1.0, 1.0,
+        1.0,-1.0,-1.0,
+        1.0, 1.0,-1.0,
+        1.0,-1.0,-1.0,
+        1.0, 1.0, 1.0,
+        1.0,-1.0, 1.0,
+        1.0, 1.0, 1.0,
+        1.0, 1.0,-1.0,
+        -1.0, 1.0,-1.0,
+        1.0, 1.0, 1.0,
+        -1.0, 1.0,-1.0,
+        -1.0, 1.0, 1.0,
+        1.0, 1.0, 1.0,
+        -1.0, 1.0, 1.0,
+        1.0,-1.0, 1.0
+    };
+
+    color_buffer_data := []f32 {
+        0.583,  0.771,  0.014,
+        0.609,  0.115,  0.436,
+        0.327,  0.483,  0.844,
+        0.822,  0.569,  0.201,
+        0.435,  0.602,  0.223,
+        0.310,  0.747,  0.185,
+        0.597,  0.770,  0.761,
+        0.559,  0.436,  0.730,
+        0.359,  0.583,  0.152,
+        0.483,  0.596,  0.789,
+        0.559,  0.861,  0.639,
+        0.195,  0.548,  0.859,
+        0.014,  0.184,  0.576,
+        0.771,  0.328,  0.970,
+        0.406,  0.615,  0.116,
+        0.676,  0.977,  0.133,
+        0.971,  0.572,  0.833,
+        0.140,  0.616,  0.489,
+        0.997,  0.513,  0.064,
+        0.945,  0.719,  0.592,
+        0.543,  0.021,  0.978,
+        0.279,  0.317,  0.505,
+        0.167,  0.620,  0.077,
+        0.347,  0.857,  0.137,
+        0.055,  0.953,  0.042,
+        0.714,  0.505,  0.345,
+        0.783,  0.290,  0.734,
+        0.722,  0.645,  0.174,
+        0.302,  0.455,  0.848,
+        0.225,  0.587,  0.040,
+        0.517,  0.713,  0.338,
+        0.053,  0.959,  0.120,
+        0.393,  0.621,  0.362,
+        0.673,  0.211,  0.457,
+        0.820,  0.883,  0.371,
+        0.982,  0.099,  0.879
+    };
+
+    vertex_buffer : u32 = ---;
+    gl.GenBuffers(1, &vertex_buffer);
+    gl.BindBuffer(gl.ARRAY_BUFFER, vertex_buffer);
+    gl.BufferData(gl.ARRAY_BUFFER, len(vertex_buffer_data) * size_of(f32), &vertex_buffer_data[0], gl.STATIC_DRAW);
+
+    color_buffer: u32 = ---;
+    gl.GenBuffers(1, &color_buffer);
+    gl.BindBuffer(gl.ARRAY_BUFFER, color_buffer);
+    gl.BufferData(gl.ARRAY_BUFFER, len(color_buffer_data) * size_of(f32), &color_buffer_data[0], gl.STATIC_DRAW);
+
     projection := math.perspective(45, cast(f32)RES_X / cast(f32)RES_Y, 0.1, 100);
     model := math.identity(math.Mat4);
 
-    mvp_id := gl.get_uniform_location(program, "MVP");
-    aspect_id := gl.get_uniform_location(program, "aspect");
-    time_id := gl.get_uniform_location(program, "time");
-    viewMatrixId := gl.get_uniform_location(program, "viewMatrix");
-    projectionMatrixId := gl.get_uniform_location(program, "projectionMatrix");
-    worldSpaceCameraPosId := gl.get_uniform_location(program, "worldSpaceCameraPos");
-    projectionParamsId := gl.get_uniform_location(program, "projectionParams");
+
 
     last_time := glfw.get_time();
 
@@ -95,11 +215,15 @@ run :: proc() -> int {
         window_width, window_height := glfw.get_window_size(window);
         aspect := cast(f32)(cast(f32)window_height / cast(f32)window_width);
         camera.Camera_init(&cam, aspect);
-        cam.position = math.Vec3 { 0, 0, -3.0 };
+        cam.position = math.Vec3 { 0, 0.2, -3.6 };
     }
 
     SHADER_UPDATE_INTERVAL :: 0.3;
     next_shader_update := last_time + SHADER_UPDATE_INTERVAL;
+
+    //gl.DepthMask(gl.TRUE);
+    //gl.DepthFunc(gl.LESS);
+    gl.Enable(gl.DEPTH_TEST);
 
     for !glfw.window_should_close(window) {
 
@@ -116,35 +240,49 @@ run :: proc() -> int {
 
         gl.Clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
 
-        gl.UseProgram(program);
-        gl.Uniform1f(aspect_id, aspect);
-        gl.Uniform1f(time_id, cast(f32)glfw.get_time());
+        { // RAYMARCH
+            time_id := gl.get_uniform_location(program.id, "time");
+            projectionMatrixId := gl.get_uniform_location(program.id, "projectionMatrix");
+            worldSpaceCameraPosId := gl.get_uniform_location(program.id, "worldSpaceCameraPos");
+            projectionParamsId := gl.get_uniform_location(program.id, "projectionParams");
+            gl.UseProgram(program.id);
+            gl.Uniform1f(gl.get_uniform_location(program.id, "aspect"), aspect);
+            gl.Uniform1f(time_id, cast(f32)glfw.get_time());
+            gl.UniformMatrix4fv(projectionMatrixId, 1, gl.FALSE, &projection[0][0]);
+            gl.Uniform3fv(worldSpaceCameraPosId, 1, &cam.position[0]);
+            gl.Uniform3fv(gl.get_uniform_location(program.id, "cam_forward"), 1, &cam.forward[0]);
+            gl.Uniform3fv(gl.get_uniform_location(program.id, "cam_up"), 1, &cam.up[0]);
+            gl.Uniform3fv(gl.get_uniform_location(program.id, "cam_right"), 1, &cam.right[0]);
+            projectionParams := math.Vec4 { -1.0, cam.near, cam.far, cast(f32)(1.0 / cam.far) };
+            gl.Uniform4fv(projectionParamsId, 1, &projectionParams[0]);
+            gl.DrawArrays(gl.TRIANGLES, 0, 3);
+        }
 
-        gl.UniformMatrix4fv(mvp_id, 1, gl.FALSE, &mvp[0][0]);
-        gl.UniformMatrix4fv(viewMatrixId, 1, gl.FALSE, &view[0][0]);
-        gl.UniformMatrix4fv(projectionMatrixId, 1, gl.FALSE, &projection[0][0]);
-        gl.Uniform3fv(worldSpaceCameraPosId, 1, &cam.position[0]);
+        { // CUBE
+            gl.UseProgram(cube_program.id);
+            gl.UniformMatrix4fv(gl.get_uniform_location(cube_program.id, "MVP"), 1, gl.FALSE, &mvp[0][0]); // TODO: don't do get_uniform_location every frame
 
-        projectionMatrixIsFlipped:f32 = -1.0;
+            gl.EnableVertexAttribArray(0);
+            gl.BindBuffer(gl.ARRAY_BUFFER, vertex_buffer);
+            gl.VertexAttribPointer(0, 3, gl.FLOAT, gl.FALSE, 0, nil);
 
-        projectionParams := math.Vec4 {
-            projectionMatrixIsFlipped,
-            cam.near,
-            cam.far,
-            cast(f32)(1.0 / cam.far)
-        };
-        gl.Uniform4fv(projectionParamsId, 1, &projectionParams[0]);
+            gl.EnableVertexAttribArray(1);
+            gl.BindBuffer(gl.ARRAY_BUFFER, color_buffer);
+            gl.VertexAttribPointer(1, 3, gl.FLOAT, gl.FALSE, 0, nil);
 
-        gl.DrawArrays(gl.TRIANGLES, 0, 3);
+            gl.DrawArrays(gl.TRIANGLES, 0, 12 * 3);
+            gl.DisableVertexAttribArray(0);
+            gl.DisableVertexAttribArray(1);
+        }
+
 
         glfw.swap_buffers(window);
         glfw.poll_events();
         glfw.calculate_frame_timings(window);
 
         if current_time > next_shader_update {
-            updated := false;
-            program, last_vertex_time, last_fragment_time, updated = gl.update_shader_if_changed(
-                vertex_name, fragment_name, program, last_vertex_time, last_fragment_time);
+            Shader_update_if_changed(&program);
+            Shader_update_if_changed(&cube_program);
             next_shader_update = current_time + SHADER_UPDATE_INTERVAL;
         }
 
