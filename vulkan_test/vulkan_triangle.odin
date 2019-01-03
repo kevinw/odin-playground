@@ -547,6 +547,7 @@ run :: proc() -> int {
 
     // retrieve swapchain images
     swapchain_images: []vk.Image;
+    swapchain_framebuffers: []vk.Framebuffer;
     swapchain_imageviews: []vk.Image_View;
     {
         image_count: u32 = ---;
@@ -592,13 +593,24 @@ run :: proc() -> int {
 
             }
         }
-        defer for _, i in swapchain_imageviews do vk.destroy_image_view(device, swapchain_imageviews[i], nil);
     }
+    defer for _, i in swapchain_imageviews do vk.destroy_image_view(device, swapchain_imageviews[i], nil);
 
     // create render pass
     render_pass : vk.Render_Pass;
     pipeline_layout : vk.Pipeline_Layout;
     {
+        dependency := vk.Subpass_Dependency {
+            src_subpass = vk.SUBPASS_EXTERNAL,
+            dst_subpass = 0,
+            src_stage_mask = {vk.Pipeline_Stage_Flag.Color_Attachment_Output},
+            src_access_mask = {},
+
+            dst_stage_mask = {vk.Pipeline_Stage_Flag.Color_Attachment_Output},
+            dst_access_mask = {vk.Access_Flag.Color_Attachment_Read, vk.Access_Flag.Color_Attachment_Write},
+
+        };
+
         color_attachment := vk.Attachment_Description {
             format = swapchain_image_format,
             samples = {vk.Sample_Count_Flag._1},
@@ -632,6 +644,8 @@ run :: proc() -> int {
             attachments = &color_attachment,
             subpass_count = 1,
             subpasses = &subpass,
+            dependency_count = 1,
+            dependencies = &dependency,
         };
 
         if vk.Result.Success != vk.create_render_pass(device, &render_pass_info, nil, &render_pass) {
@@ -831,9 +845,123 @@ run :: proc() -> int {
             return -1;
         }
     }
+    defer vk.destroy_pipeline_layout(device, pipeline_layout, nil);
     defer vk.destroy_pipeline(device, graphics_pipeline, nil);
 
-    defer vk.destroy_pipeline_layout(device, pipeline_layout, nil);
+    // create framebuffers
+    {
+        swapchain_framebuffers = make([]vk.Framebuffer, len(swapchain_imageviews));
+        for i := 0; i < len(swapchain_imageviews); i += 1 {
+            attachments := []vk.Image_View { swapchain_imageviews[i] };
+            framebuffer_info := vk.Framebuffer_Create_Info {
+                s_type = vk.Structure_Type.Framebuffer_Create_Info,
+                render_pass = render_pass,
+                attachment_count = 1,
+                attachments = &attachments[0],
+                width = swapchain_extent.width,
+                height = swapchain_extent.height,
+                layers = 1, // number of images in image arrays
+            };
+            if vk.Result.Success != vk.create_framebuffer(device, &framebuffer_info, nil, &swapchain_framebuffers[i]) {
+                fmt.println_err("Error: failed to create framebuffer");
+                return -1;
+            }
+        }
+    }
+    defer for framebuffer in swapchain_framebuffers do vk.destroy_framebuffer(device, framebuffer, nil);
+
+    // create command pool
+    command_pool : vk.Command_Pool;
+    {
+        pool_info := vk.Command_Pool_Create_Info {
+            s_type = vk.Structure_Type.Command_Pool_Create_Info,
+            queue_family_index = graphics_family_index,
+            //flags = 0, // optional
+        };
+        if vk.Result.Success != vk.create_command_pool(device, &pool_info, nil, &command_pool) {
+            fmt.println_err("Error: Failed to create command pool.");
+            return -1;
+        }
+    }
+    defer vk.destroy_command_pool(device, command_pool, nil);
+
+    // create command buffers
+    command_buffers: []vk.Command_Buffer;
+    {
+        command_buffers = make([]vk.Command_Buffer, len(swapchain_framebuffers));
+
+        alloc_info := vk.Command_Buffer_Allocate_Info {
+            s_type = vk.Structure_Type.Command_Buffer_Allocate_Info,
+            command_pool = command_pool,
+            level = vk.Command_Buffer_Level.Primary,
+            command_buffer_count = u32(len(command_buffers)),
+        };
+
+        if vk.Result.Success != vk.allocate_command_buffers(device, &alloc_info, &command_buffers[0]) {
+            fmt.println_err("Error: Failed to allocate command buffers.");
+            return -1;
+        }
+    }
+
+    // start command buffer recording
+    {
+        for _, i in command_buffers {
+            begin_info := vk.Command_Buffer_Begin_Info {
+                s_type = vk.Structure_Type.Command_Buffer_Begin_Info,
+                flags = {vk.Command_Buffer_Usage_Flag.Simultaneous_Use},
+                inheritance_info = nil, // optional for secondary command buffers
+            };
+            if vk.Result.Success != vk.begin_command_buffer(command_buffers[i], &begin_info) {
+                fmt.println_err("Error: Failed to begin recording command buffer", i);
+                return -1;
+            }
+
+            clear_value : vk.Clear_Value;
+            clear_value.color.float32 = {0, 0, 0, 1};
+            clear_value.depth_stencil = {depth=0, stencil=0};
+
+            render_pass_info := vk.Render_Pass_Begin_Info {
+                s_type = vk.Structure_Type.Render_Pass_Begin_Info,
+                render_pass = render_pass,
+                framebuffer = swapchain_framebuffers[i],
+                render_area = {
+                    offset = {0, 0}, // @Perf: should match attachment sizes for best performance
+                    extent = swapchain_extent,
+                },
+                clear_value_count = 1,
+                clear_values = &clear_value,
+            };
+
+            // Draw the triangle
+            vk.cmd_begin_render_pass(command_buffers[i], &render_pass_info, vk.Subpass_Contents.Inline);
+            vk.cmd_bind_pipeline(command_buffers[i], vk.Pipeline_Bind_Point.Graphics, graphics_pipeline);
+            vk.cmd_draw(
+                command_buffer=command_buffers[i],
+                vertex_count=3,
+                instance_count=1,
+                first_vertex=0,
+                first_instance=0);
+            vk.cmd_end_render_pass(command_buffers[i]);
+
+            if vk.Result.Success != vk.end_command_buffer(command_buffers[i]) {
+                fmt.println_err("Error: Failed to record command buffer", i);
+                return -1;
+            }
+        }
+    }
+
+    image_available_semaphore, render_finished_semaphore : vk.Semaphore;
+    { // create semaphores
+        semaphore_info := vk.Semaphore_Create_Info { s_type = vk.Structure_Type.Semaphore_Create_Info };
+
+        if vk.Result.Success != vk.create_semaphore(device, &semaphore_info, nil, &image_available_semaphore) ||
+            vk.Result.Success != vk.create_semaphore(device, &semaphore_info, nil, &render_finished_semaphore) {
+            fmt.println_err("Error: Failed to create semaphores.");
+            return -1;
+        }
+    }
+    defer vk.destroy_semaphore(device, image_available_semaphore, nil);
+    defer vk.destroy_semaphore(device, render_finished_semaphore, nil);
 
     for !glfw.window_should_close(window) {
         frame_count += 1;
@@ -845,6 +973,58 @@ run :: proc() -> int {
 
         //glfw.swap_buffers(window);
         glfw.poll_events();
+
+        // ~~~~ DRAW FRAME
+        {
+            image_index : u32 = ---;
+            vk.acquire_next_image_khr(device, swapchain, bits.U64_MAX, image_available_semaphore, nil, &image_index);
+
+
+            wait_semaphores := [1]vk.Semaphore { image_available_semaphore };
+
+            wait_stages : [1]vk.Pipeline_Stage_Flags = {
+                {vk.Pipeline_Stage_Flag.Color_Attachment_Output}
+            };
+
+            signal_semaphores := [1]vk.Semaphore { render_finished_semaphore };
+            assert(len(signal_semaphores) == 1);
+
+            submit_info := vk.Submit_Info {
+                s_type = vk.Structure_Type.Submit_Info,
+                wait_semaphore_count = 1,
+                wait_semaphores = &wait_semaphores[0],
+                wait_dst_stage_mask = &wait_stages[0],
+                command_buffer_count = 1,
+                command_buffers = &command_buffers[image_index],
+
+                signal_semaphore_count = 1,
+                signal_semaphores = &signal_semaphores[0],
+            };
+
+            if vk.Result.Success != vk.queue_submit(graphics_queue, 1, &submit_info, nil) {
+                fmt.println_err("Error: Failed to submit draw command buffer");
+                return -1;
+            }
+
+            swapchains := [1]vk.Swapchain_KHR {swapchain};
+            present_info := vk.Present_Info_KHR {
+                s_type = vk.Structure_Type.Present_Info_KHR,
+                wait_semaphore_count = 1,
+                wait_semaphores = &signal_semaphores[0],
+
+                swapchain_count = 1,
+                swapchains = &swapchains[0],
+
+                image_indices = &image_index,
+
+                results = nil, // optional for many results
+            };
+            vk.queue_present_khr(present_queue, &present_info);
+
+        }
+
+        vk.device_wait_idle(device);
+
         glfw.calculate_frame_timings(window);
 
         last_time = current_time;
