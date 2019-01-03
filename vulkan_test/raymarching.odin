@@ -31,7 +31,6 @@ key_callback :: proc "c" (window: glfw.Window_Handle, key: i32, scancode: i32, a
     }
 }
 
-
 vulkan_init_helper :: proc(resx := 1280, resy := 720, title := "Window title", samples := 0) -> glfw.Window_Handle {
     //
     error_callback :: proc"c"(error: i32, desc: cstring) {
@@ -457,6 +456,7 @@ run :: proc() -> int {
 
     // create swap chain
     swapchain: vk.Swapchain_KHR;
+    swapchain_image_format: vk.Format;
     {
         swap_chain_support := query_swap_chain_support(physical_device, surface);
         using swap_chain_support;
@@ -471,6 +471,8 @@ run :: proc() -> int {
         if capabilities.max_image_count > 0 && image_count > capabilities.max_image_count { // zero means no limit
             image_count = capabilities.max_image_count;
         }
+
+        swapchain_image_format = surface_format.format;
 
         swapchain_create_info := vk.Swapchain_Create_Info_KHR {
             s_type = vk.Structure_Type.Swapchain_Create_Info_KHR,
@@ -509,12 +511,53 @@ run :: proc() -> int {
     defer vk.destroy_swapchain_khr(device, swapchain, nil);
 
     // retrieve swapchain images
+    swapchain_images: []vk.Image;
+    swapchain_imageviews: []vk.Image_View;
     {
         image_count: u32 = ---;
         vk.get_swapchain_images_khr(device, swapchain, &image_count, nil);
-        swapchain_images := make([]vk.Image, image_count);
+        swapchain_images = make([]vk.Image, image_count);
         defer delete(swapchain_images);
         vk.get_swapchain_images_khr(device, swapchain, &image_count, mem.raw_data(swapchain_images));
+
+        // create image views
+        {
+            swapchain_imageviews = make([]vk.Image_View, len(swapchain_images));
+            for _, i in swapchain_images {
+                imageview_create_info := vk.Image_View_Create_Info {
+                    s_type = vk.Structure_Type.Image_View_Create_Info,
+                    image = swapchain_images[i],
+                    view_type = vk.Image_View_Type.D2,
+                    format = swapchain_image_format,
+                };
+                {
+                    using imageview_create_info;
+                    components.r = vk.Component_Swizzle.Identity;
+                    components.g = vk.Component_Swizzle.Identity;
+                    components.b = vk.Component_Swizzle.Identity;
+                    components.a = vk.Component_Swizzle.Identity;
+
+                    subresource_range.aspect_mask = {vk.Image_Aspect_Flag.Color};
+                    subresource_range.base_mip_level = 0;
+                    subresource_range.level_count = 1;
+                    subresource_range.base_array_layer = 0;
+                    subresource_range.layer_count = 1;
+                    /* TODO: If you were working on a stereographic 3D
+                    * application, then you would create a swap chain with
+                    * multiple layers. You could then create multiple image
+                    * views for each image representing the views for the left
+                    * and right eyes by accessing different layers.
+                    */
+                }
+
+                if vk.Result.Success != vk.create_image_view(device, &imageview_create_info, nil, &swapchain_imageviews[i]) {
+                    fmt.println_err("error: failed to create image view", i);
+                    return -1;
+                }
+
+            }
+        }
+        defer for _, i in swapchain_imageviews do vk.destroy_image_view(device, swapchain_imageviews[i], nil);
     }
 
     for !glfw.window_should_close(window) {
