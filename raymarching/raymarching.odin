@@ -3,9 +3,11 @@ package raymarching
 import "../glutil"
 import "../camera"
 import "../path"
+import "../gui"
 
 import "shared:odin-glfw"
 import "shared:odin-gl"
+import "shared:odin-imgui"
 
 import "core:fmt"
 import "core:math";
@@ -82,6 +84,11 @@ run :: proc() -> int {
 
     glfw.set_key_callback(window, key_callback);
     glfw.set_input_mode(window, glfw.CURSOR, auto_cast glfw.CURSOR_DISABLED);
+
+    // init gui
+    gui_state : gui.State;
+    gui.init(&gui_state, window);
+    defer gui.deinit(&gui_state);
 
     vertex_name := fmt.tprint(path.dir_name(#file), "/shaders/vert.glsl");
     fragment_name := fmt.tprint(path.dir_name(#file), "/shaders/frag.glsl");
@@ -199,10 +206,8 @@ run :: proc() -> int {
     gl.BindBuffer(gl.ARRAY_BUFFER, color_buffer);
     gl.BufferData(gl.ARRAY_BUFFER, len(color_buffer_data) * size_of(f32), &color_buffer_data[0], gl.STATIC_DRAW);
 
-    projection := math.perspective(45, cast(f32)RES_X / cast(f32)RES_Y, 0.1, 100);
-    model := math.identity(math.Mat4);
-
-
+    //projection := math.perspective(45, cast(f32)RES_X / cast(f32)RES_Y, 0.1, 100);
+    //model := math.identity(math.Mat4);
 
     last_time := glfw.get_time();
 
@@ -214,7 +219,7 @@ run :: proc() -> int {
     {
         window_width, window_height := glfw.get_window_size(window);
         aspect := cast(f32)(cast(f32)window_height / cast(f32)window_width);
-        camera.Camera_init(&cam, aspect);
+        camera.init(&cam, aspect);
         cam.position = math.Vec3 { 0, 0.2, -3.6 };
     }
 
@@ -225,10 +230,14 @@ run :: proc() -> int {
     //gl.DepthFunc(gl.LESS);
     gl.Enable(gl.DEPTH_TEST);
 
+    frustum_corners : [8]math.Vec3 = ---;
+
+    frame_count := 0;
+
     for !glfw.window_should_close(window) {
+        frame_count += 1;
 
         window_width, window_height := glfw.get_window_size(window);
-        aspect := cast(f32)(cast(f32)window_height / cast(f32)window_width);
 
         current_time := glfw.get_time();
         delta_time := cast(f32)(current_time - last_time);
@@ -236,11 +245,17 @@ run :: proc() -> int {
         camera.FlyControls_update(window, &cam, &flycam, delta_time);
         camera.view_matrix(&cam, &view);
 
-        mvp := math.mul(math.mul(projection, view), model);
+        camera.frustum_corners(&cam, frustum_corners);
+        //fmt.println(frustum_corners);
 
         gl.Clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+        /*
+
+        mvp := math.mul(math.mul(projection, view), model);
 
         { // RAYMARCH
+
+            aspect := cast(f32)(cast(f32)window_height / cast(f32)window_width);
             time_id := gl.get_uniform_location(program.id, "time");
             projectionMatrixId := gl.get_uniform_location(program.id, "projectionMatrix");
             worldSpaceCameraPosId := gl.get_uniform_location(program.id, "worldSpaceCameraPos");
@@ -274,8 +289,32 @@ run :: proc() -> int {
             gl.DisableVertexAttribArray(0);
             gl.DisableVertexAttribArray(1);
         }
+        */
 
 
+        // GUI
+        {
+            frame_state : gui.Frame_State;
+            {
+                frame_state.deltatime = delta_time;
+                frame_state.window_width = window_width;
+                frame_state.window_height = window_height;
+                frame_state.window_focus = 0 != glfw.get_window_attrib(window, glfw.FOCUSED);
+
+                xpos, ypos := glfw.get_cursor_pos(window);
+                frame_state.mouse_x = int(xpos);
+                frame_state.mouse_y = int(ypos);
+                frame_state.mouse_wheel = 0; // TODO
+                frame_state.left_mouse = 0 != glfw.get_mouse_button(window, glfw.MOUSE_BUTTON_LEFT);
+                frame_state.right_mouse = 0 != glfw.get_mouse_button(window, glfw.MOUSE_BUTTON_RIGHT);
+            }
+            gui.begin_new_frame(window, &frame_state);
+        }
+
+        imgui.show_demo_window();
+
+
+        gui.render_proc(&gui_state, true);
         glfw.swap_buffers(window);
         glfw.poll_events();
         glfw.calculate_frame_timings(window);

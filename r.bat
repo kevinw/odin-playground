@@ -1,3 +1,3 @@
 @setlocal
 
-@..\odin\odin run main.odin -vet
+@..\odin\odin run main.odin -vet -debug -opt=0

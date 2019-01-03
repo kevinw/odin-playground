@@ -17,17 +17,90 @@ Camera :: struct {
     far: f32,
 }
 
-Camera_init :: proc(
+init :: proc(
     camera: ^Camera,
     aspect: f32,
     fov: f32 = 45.0,
     near: f32 = 0.1,
-    far: f32 = 100.0
+    far: f32 = 10.0
 ) {
     camera.aspect = aspect;
     camera.fov = fov;
     camera.near = near;
     camera.far = far;
+}
+
+import "core:fmt"
+
+frustum_planes_old :: proc (cam: ^Camera, planes: [8]Vec3) {
+    using math;
+
+    view : Mat4 = ---;
+    view_matrix(cam, &view);
+
+    proj : Mat4 = ---;
+    projection_matrix(cam, &proj);
+
+    fmt.println("view", view);
+    fmt.println("proj", proj);
+
+    inv := inverse(mul(view, proj));
+
+    ndc_planes : [8]Vec4 = {
+        // near face
+        Vec4 {1, 1, -1, 1},
+        Vec4 {-1, 1, -1, 1},
+        Vec4 {1, -1, -1, 1},
+        Vec4 {-1, -1, -1, 1},
+
+        // far face
+        Vec4 {1, 1, 1, 1},
+        Vec4 {-1, 1, 1 , 1},
+        Vec4 {1, -1, 1 , 1},
+        Vec4 {-1, -1,1, 1},
+    };
+
+    for i := 0; i < 8; i += 1 {
+        ff : Vec4 = mul(inv, ndc_planes[i]);
+        planes[i].x = ff.x / ff.w;
+    }
+}
+
+transform_vector :: proc(cam: ^Camera, vec: Vec3) {
+}
+
+frustum_corners :: proc(cam: ^Camera, planes: [8]Vec3) {
+    fov_radians := to_radians(cam.fov);
+
+    near_center := cam.position - cam.forward * cam.near;
+    far_center := cam.position - cam.forward * cam.far;
+
+    near_height := 2. * math.tan(fov_radians / 2.) * cam.near;
+    far_height := 2. * math.tan(fov_radians / 2.) * cam.far;
+
+    near_width := near_height * cam.aspect;
+    far_width := far_height * cam.aspect;
+
+    far_top_left := far_center + cam.up * (far_height*0.5) - cam.right * (far_width*0.5);
+    far_top_right := far_center + cam.up * (far_height*0.5) + cam.right * (far_width*0.5);
+    far_bottom_left := far_center - cam.up * (far_height*0.5) - cam.right * (far_width*0.5);
+    far_bottom_right := far_center - cam.up * (far_height*0.5) + cam.right * (far_width*0.5);
+
+    near_top_left := near_center + cam.position.y * (near_height*0.5) - cam.position.x * (near_width*0.5);
+    near_top_right := near_center + cam.position.y * (near_height*0.5) + cam.position.x * (near_width*0.5);
+    near_bottom_left := near_center - cam.position.y * (near_height*0.5) - cam.position.x * (near_width*0.5);
+    near_bottom_right := near_center - cam.position.y * (near_height*0.5) + cam.position.x * (near_width*0.5);
+
+    // TODO: just pass a Z value (like near or far) and use that instead to calculate 4 corners
+    planes[0] = near_bottom_left;
+    planes[1] = near_bottom_right;
+    planes[2] = near_top_left;
+    planes[3] = near_top_right;
+
+    planes[4] = far_bottom_left;
+    planes[5] = far_bottom_right;
+    planes[6] = far_top_left;
+    planes[7] = far_top_right;
 }
 
 view_matrix :: inline proc(using camera: ^Camera, mat: ^Mat4) {

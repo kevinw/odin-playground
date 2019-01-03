@@ -1,6 +1,6 @@
 package main
 
-import main_pkg "raymarching"
+import main_pkg "vulkan_test"
 
 import "core:os"
 

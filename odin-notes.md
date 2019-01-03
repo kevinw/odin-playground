@@ -11,6 +11,8 @@ Some thoughts jotted down while learning Odin...
 
 * compile-time (plus link) still feels slow for a tiny example
 * I'm missing default arguments. As an example...
+* error messages
+    * It'd be nice if the compiler provided more context: `gui.odin(230:47) Cannot assign value 'io.display_framebuffer_scale' of type 'Vec2' to 'Vec2' in argument`
 
 ```
 Camera :: struct {

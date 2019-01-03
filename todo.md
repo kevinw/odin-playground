@@ -1,7 +1,8 @@
 ### TODO
 
-- Get frustum corners from "camera" and use interpolatedRay from my own gist to calculate screen rays https://gist.github.com/kevinw/80593a34b7211d99d251d266e957fe87
+- Get frustum corners from "camera" and use interpolatedRay from my own [gist to calculate screen rays](https://gist.github.com/kevinw/80593a34b7211d99d251d266e957fe87)
 - Try odin's Oculus bindings
+- Play sounds with [mini_al](https://github.com/dr-soft/mini_al)
 - Read through and grok [odin-gl_examples](https://github.com/vassvik/odin-gl_examples)
 - Try Looking Glass instanced rendering, and [screen space reprojection for raymarching](https://github.com/HamtaroDeluxe/RMVR)
 - Load models with [cgltf](https://github.com/jkuhlmann/cgltf) or something similar
