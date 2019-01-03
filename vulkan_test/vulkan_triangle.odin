@@ -67,6 +67,40 @@ required_device_extensions := []cstring {
     "VK_KHR_swapchain",
 };
 
+create_shader_module :: proc(device: vk.Device, code: []u8) -> (vk.Result, vk.Shader_Module) {
+    padded_code : []u8;
+
+    unpadded_len := len(code);
+    needs_delete := false;
+
+    if false && (unpadded_len % 4) != 0 { // TODO might not be necessary?
+        padded_len := unpadded_len;
+        for {
+            padded_len += 1;
+            if (padded_len % 4) == 0 do break;
+        }
+
+        padded_code = make([]u8, padded_len);
+        mem.copy(&padded_code[0], &code, unpadded_len);
+        needs_delete = true;
+    } else {
+        padded_code = code;
+    }
+
+    if needs_delete do defer delete(padded_code);
+
+    info: vk.Shader_Module_Create_Info = {
+        s_type = vk.Structure_Type.Shader_Module_Create_Info,
+        code_size = len(code),
+        code = auto_cast &padded_code[0],
+    };
+
+    shader_module: vk.Shader_Module;
+    result := vk.create_shader_module(device, &info, nil, &shader_module);
+
+    return result, shader_module;
+}
+
 is_device_suitable :: proc(device: vk.Physical_Device, surface: vk.Surface_KHR) -> bool {
     // return true if the device has all the required_device_extensions
     extension_count: u32 = ---;
@@ -457,6 +491,7 @@ run :: proc() -> int {
     // create swap chain
     swapchain: vk.Swapchain_KHR;
     swapchain_image_format: vk.Format;
+    swapchain_extent: vk.Extent2D;
     {
         swap_chain_support := query_swap_chain_support(physical_device, surface);
         using swap_chain_support;
@@ -465,7 +500,7 @@ run :: proc() -> int {
 
         surface_format := choose_swap_surface_format(formats);
         present_mode := choose_swap_present_mode(present_modes);
-        extent := choose_swap_extent(&capabilities, WIDTH, HEIGHT);
+        swapchain_extent = choose_swap_extent(&capabilities, WIDTH, HEIGHT);
 
         image_count := capabilities.min_image_count + 1;
         if capabilities.max_image_count > 0 && image_count > capabilities.max_image_count { // zero means no limit
@@ -480,7 +515,7 @@ run :: proc() -> int {
             min_image_count = image_count,
             image_format = surface_format.format,
             image_color_space = surface_format.color_space,
-            image_extent = extent,
+            image_extent = swapchain_extent,
             image_array_layers = 1, // TODO: STEREOSCOPIC or MULTIVIEW HERE
             image_usage = {vk.Image_Usage_Flag.Color_Attachment},
 
@@ -559,6 +594,246 @@ run :: proc() -> int {
         }
         defer for _, i in swapchain_imageviews do vk.destroy_image_view(device, swapchain_imageviews[i], nil);
     }
+
+    // create render pass
+    render_pass : vk.Render_Pass;
+    pipeline_layout : vk.Pipeline_Layout;
+    {
+        color_attachment := vk.Attachment_Description {
+            format = swapchain_image_format,
+            samples = {vk.Sample_Count_Flag._1},
+            load_op = vk.Attachment_Load_Op.Clear,
+            store_op = vk.Attachment_Store_Op.Store,
+            stencil_load_op = vk.Attachment_Load_Op.Dont_Care,
+            stencil_store_op = vk.Attachment_Store_Op.Dont_Care,
+            initial_layout = vk.Image_Layout.Undefined,
+            final_layout = vk.Image_Layout.Present_Src_KHR,
+        };
+
+        // subpasses
+        color_attachment_ref := vk.Attachment_Reference {
+            attachment = 0, // layout(location = 0) out vec4 outColor 
+            layout = vk.Image_Layout.Color_Attachment_Optimal,
+        };
+
+        subpass := vk.Subpass_Description {
+            pipeline_bind_point = vk.Pipeline_Bind_Point.Graphics,
+            color_attachment_count = 1,
+            color_attachments = &color_attachment_ref,
+            //input_attachments
+            //resolve_attachments
+            //depth_stencil_attachments
+            //preserve_attachments
+        };
+
+        render_pass_info := vk.Render_Pass_Create_Info {
+            s_type = vk.Structure_Type.Render_Pass_Create_Info,
+            attachment_count = 1,
+            attachments = &color_attachment,
+            subpass_count = 1,
+            subpasses = &subpass,
+        };
+
+        if vk.Result.Success != vk.create_render_pass(device, &render_pass_info, nil, &render_pass) {
+            fmt.println_err("Error: failed to create render pass");
+            return -1;
+        }
+    }
+    defer vk.destroy_render_pass(device, render_pass, nil);
+
+    // create graphics pipeline
+    graphics_pipeline : vk.Pipeline;
+    {
+        vert_filename := "vulkan_test/shaders/shader.vert.spv";
+        frag_filename := "vulkan_test/shaders/shader.frag.spv";
+
+        vert_shader_code, success1 := os.read_entire_file(vert_filename);
+        if !success1 {
+            fmt.println_err("error: could not read", vert_filename);
+            return -1;
+        }
+
+        frag_shader_code, success2 := os.read_entire_file(frag_filename);
+        if !success2 {
+            fmt.println_err("Error: Could not read", frag_filename);
+            return -1;
+        }
+
+        success3, vert_shader_module := create_shader_module(device, vert_shader_code);
+        if success3 != vk.Result.Success {
+            fmt.println_err("Error: Could not create a shader module for", vert_filename);
+            return -1;
+        }
+        defer vk.destroy_shader_module(device, vert_shader_module, nil);
+
+        res4, frag_shader_module := create_shader_module(device, frag_shader_code);
+        if res4 != vk.Result.Success {
+            fmt.println_err("Error: Could not create a shader module for", frag_filename);
+            return -1;
+        }
+        defer vk.destroy_shader_module(device, frag_shader_module, nil);
+
+        vert_shader_stage_info := vk.Pipeline_Shader_Stage_Create_Info {
+            s_type = vk.Structure_Type.Pipeline_Shader_Stage_Create_Info,
+            stage = {vk.Shader_Stage_Flag.Vertex},
+            module = vert_shader_module,
+            name = "main",
+            specialization_info = nil, // TODO: use this to make shader variants
+        };
+
+        frag_shader_stage_info := vk.Pipeline_Shader_Stage_Create_Info {
+            s_type = vk.Structure_Type.Pipeline_Shader_Stage_Create_Info,
+            stage = {vk.Shader_Stage_Flag.Fragment},
+            module = frag_shader_module,
+            name = "main",
+        };
+
+        shader_stages := []vk.Pipeline_Shader_Stage_Create_Info { vert_shader_stage_info, frag_shader_stage_info, };
+
+        vertex_input_info := vk.Pipeline_Vertex_Input_State_Create_Info {
+            s_type = vk.Structure_Type.Pipeline_Vertex_Input_State_Create_Info,
+            //vertexBindingDescriptionCount = 0,
+            //pVertexBindingDescriptions = nil, // Optional
+            //vertexAttributeDescriptionCount = 0,
+            //pVertexAttributeDescriptions = nil, // Optional
+        };
+
+        input_assembly := vk.Pipeline_Input_Assembly_State_Create_Info {
+            s_type = vk.Structure_Type.Pipeline_Input_Assembly_State_Create_Info,
+            topology = vk.Primitive_Topology.Triangle_List,
+            primitive_restart_enable = false,
+        };
+
+        viewport := vk.Viewport {
+            x=0, y=0, width=f32(swapchain_extent.width), height=f32(swapchain_extent.height),
+            min_depth = 0, max_depth = 1};
+
+        scissor := vk.Rect2D { offset = {0, 0}, extent = swapchain_extent, };
+
+        viewport_state := vk.Pipeline_Viewport_State_Create_Info {
+            s_type = vk.Structure_Type.Pipeline_Viewport_State_Create_Info,
+            viewport_count = 1,
+            viewports = &viewport,
+            scissor_count = 1,
+            scissors = &scissor,
+        };
+
+        rasterizer := vk.Pipeline_Rasterization_State_Create_Info {
+            s_type = vk.Structure_Type.Pipeline_Rasterization_State_Create_Info,
+            depth_clamp_enable = false, // clamp fragments to near and far planes (requires a gpu feature enabled)
+            rasterizer_discard_enable = false,
+            polygon_mode = vk.Polygon_Mode.Fill,
+            //polygon_mode = vk.Polygon_Mode.Line, // requires gpu feature
+            //polygon_mode = vk.Polygon_Mode.Point, // requires gpu feature
+            line_width = 1,
+            cull_mode = {vk.Cull_Mode_Flag.Back},
+            front_face = vk.Front_Face.Clockwise,
+
+            depth_bias_enable = false,
+            depth_bias_constant_factor = 0, //optional
+            depth_bias_clamp = 0, //optional
+            depth_bias_slope_factor = 0, //optional
+        };
+
+        multisampling := vk.Pipeline_Multisample_State_Create_Info {
+            s_type = vk.Structure_Type.Pipeline_Multisample_State_Create_Info,
+            sample_shading_enable = false,
+            rasterization_samples = {vk.Sample_Count_Flag._1},
+            min_sample_shading = 1,
+            sample_mask = nil,
+            alpha_to_coverage_enable = false,
+            alpha_to_one_enable = false,
+        };
+
+        color_blend_attachment := vk.Pipeline_Color_Blend_Attachment_State {
+            color_write_mask = { vk.Color_Component_Flag.R, vk.Color_Component_Flag.G, vk.Color_Component_Flag.B, vk.Color_Component_Flag.A },
+            blend_enable = false,
+
+            src_color_blend_factor = vk.Blend_Factor.One,
+            dst_color_blend_factor = vk.Blend_Factor.Zero,
+
+            color_blend_op = vk.Blend_Op.Add,
+
+            src_alpha_blend_factor = vk.Blend_Factor.One,
+            dst_alpha_blend_factor = vk.Blend_Factor.Zero,
+
+            alpha_blend_op = vk.Blend_Op.Add,
+        };
+        /*
+        ^^^^^^^ equivalent to
+        if (blendEnable) {
+            finalColor.rgb = (srcColorBlendFactor * newColor.rgb) <colorBlendOp> (dstColorBlendFactor * oldColor.rgb);
+            finalColor.a = (srcAlphaBlendFactor * newColor.a) <alphaBlendOp> (dstAlphaBlendFactor * oldColor.a);
+        } else {
+            finalColor = newColor;
+        }
+        finalColor &= colorWriteMask;
+        */
+
+        color_blending := vk.Pipeline_Color_Blend_State_Create_Info {
+            s_type = vk.Structure_Type.Pipeline_Color_Blend_State_Create_Info,
+            logic_op_enable = false,
+            logic_op = vk.Logic_Op.Copy, // optional
+            attachment_count = 1,
+            attachments = &color_blend_attachment,
+            blend_constants = {0, 0, 0, 0}, // optional
+        };
+
+        /*
+        dynamic_states := [2]vk.Dynamic_State {
+            vk.Dynamic_State.Viewport,
+            vk.Dynamic_State.Line_Width,
+        };
+
+        dynamic_state := vk.Pipeline_Dynamic_State_Create_Info {
+            s_type = vk.Structure_Type.Pipeline_Dynamic_State_Create_Info,
+            dynamic_state_count = u32(len(dynamic_states)),
+            dynamic_states = &dynamic_states[0],
+        };
+        */
+
+        pipeline_layout_info := vk.Pipeline_Layout_Create_Info {
+            s_type = vk.Structure_Type.Pipeline_Layout_Create_Info,
+            set_layout_count = 0, // optional
+            set_layouts = nil, // optional
+            push_constant_range_count = 0, //optional
+            push_constant_ranges = nil, // optional
+        };
+
+        if vk.Result.Success != vk.create_pipeline_layout(device, &pipeline_layout_info, nil, &pipeline_layout) {
+            fmt.println_err("Error: failed to create pipeline layout");
+            return -1;
+        }
+
+        graphics_pipeline_info := vk.Graphics_Pipeline_Create_Info {
+            s_type = vk.Structure_Type.Graphics_Pipeline_Create_Info,
+            stage_count = 2,
+            stages = &shader_stages[0],
+
+            vertex_input_state = &vertex_input_info,
+            input_assembly_state = &input_assembly,
+
+            viewport_state = &viewport_state,
+            rasterization_state = &rasterizer,
+            multisample_state = &multisampling,
+            depth_stencil_state = nil, // optional
+            color_blend_state = &color_blending,
+            dynamic_state = nil, // optional
+            layout = pipeline_layout,
+            render_pass = render_pass,
+            subpass = 0,
+            base_pipeline_handle = nil, //optional
+            base_pipeline_index = -1, //optional
+        };
+
+        if vk.Result.Success != vk.create_graphics_pipelines(device, nil, 1, &graphics_pipeline_info, nil, &graphics_pipeline) {
+            fmt.println_err("Error: failed to create graphics pipeline");
+            return -1;
+        }
+    }
+    defer vk.destroy_pipeline(device, graphics_pipeline, nil);
+
+    defer vk.destroy_pipeline_layout(device, pipeline_layout, nil);
 
     for !glfw.window_should_close(window) {
         frame_count += 1;
