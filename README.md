@@ -49,3 +49,7 @@ Flying around with WASD and the mouse.
 ![A displaced raymarched sphere](docs/screenshots/raymarching.png)
 
 A fullscreen raymarched sphere with displacement.
+
+## [vulkan_triangle](vulkan_triangle/vulkan_triangle.odin)
+
+![A red, blue, and green triangle rendered with Vulkan](docs/screenshots/vulkan_triangle.png)
