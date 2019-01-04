@@ -1,27 +1,37 @@
-package vulkan_test
+package vulkan_triangle
 
-import "shared:odin-glfw"
-import glfw_bindings "shared:odin-glfw/bindings"
+// Thanks to the Vulkan Tutorial "Drawing a triangle" at
+// https://vulkan-tutorial.com/Drawing_a_triangle/
+
 import "core:fmt"
 import "core:mem"
 import "core:os"
 import "core:bits"
+
 import vk "./vulkan_bindings"
 
-when os.OS == "windows" {
-    import "core:sys/win32"
-    vulkan_hmodule: win32.Hmodule;
-}
+import "shared:odin-glfw"
+import glfw_bindings "shared:odin-glfw/bindings"
 
-// not included in the glfw bindings, interacts with vulkan types
+import "../path"
+
+// not included in the GLFW bindings, interacts with vulkan types
 @(default_calling_convention="c", link_prefix="glfw")
 foreign {
     CreateWindowSurface :: proc "c" (instance:vk.Instance, window: glfw.Window_Handle, allocator: ^vk.Allocation_Callbacks, surface: ^vk.Surface_KHR) -> vk.Result ---;
 }
 
-WINDOW_TITLE := "vulkan_test";
+when os.OS == "windows" {
+    import "core:sys/win32"
+    vulkan_hmodule: win32.Hmodule;
+    exit :: proc (ret_code: int = -1) { win32.exit_process(cast(u32)ret_code); }
+}
 
+WINDOW_TITLE := "vulkan_triangle";
 VALIDATION_LAYERS_ENABLED :: true;
+MAX_FRAMES_IN_FLIGHT :: 2;
+WIDTH :: 1280;
+HEIGHT :: 720;
 
 key_callback :: proc "c" (window: glfw.Window_Handle, key: i32, scancode: i32, action: i32, mods: i32) {
     if action != i32(glfw.PRESS) do return;
@@ -32,35 +42,19 @@ key_callback :: proc "c" (window: glfw.Window_Handle, key: i32, scancode: i32, a
 }
 
 vulkan_init_helper :: proc(resx := 1280, resy := 720, title := "Window title", samples := 0) -> glfw.Window_Handle {
-    //
     error_callback :: proc"c"(error: i32, desc: cstring) {
-        fmt.printf("Error code %d: %s\n", error, desc);
+        fmt.printf_err("Error code %d: %s\n", error, desc);
     }
     glfw_bindings.SetErrorCallback(error_callback);
 
-    //
     if glfw_bindings.Init() == glfw_bindings.FALSE do return nil;
 
-    //
     if samples > 0 do glfw_bindings.WindowHint(glfw_bindings.SAMPLES, i32(samples));
-    //glfw_bindings.WindowHint(glfw_bindings.DECORATED, 1);
 
     glfw_bindings.WindowHint(i32(glfw.CLIENT_API), i32(glfw.NO_API));
     glfw_bindings.WindowHint(i32(glfw.RESIZABLE), i32(glfw.FALSE));
 
-    //glfw_bindings.WindowHint(glfw_bindings.CONTEXT_VERSION_MAJOR, i32(version_major));
-    //glfw_bindings.WindowHint(glfw_bindings.CONTEXT_VERSION_MINOR, i32(version_minor));
-    //glfw_bindings.WindowHint(glfw_bindings.OPENGL_PROFILE, bind.OPENGL_CORE_PROFILE);
-
-    //
-    window := glfw.create_window(int(resx), int(resy), title, nil, nil);
-    if window == nil do return nil;
-
-    //
-    //glfw_bindings.MakeContextCurrent(window);
-    //glfw_bindings.SwapInterval(i32(vsync));
-
-    return window;
+    return glfw.create_window(int(resx), int(resy), title, nil, nil);
 }
 
 required_device_extensions := []cstring {
@@ -68,31 +62,10 @@ required_device_extensions := []cstring {
 };
 
 create_shader_module :: proc(device: vk.Device, code: []u8) -> (vk.Result, vk.Shader_Module) {
-    padded_code : []u8;
-
-    unpadded_len := len(code);
-    needs_delete := false;
-
-    if false && (unpadded_len % 4) != 0 { // TODO might not be necessary?
-        padded_len := unpadded_len;
-        for {
-            padded_len += 1;
-            if (padded_len % 4) == 0 do break;
-        }
-
-        padded_code = make([]u8, padded_len);
-        mem.copy(&padded_code[0], &code, unpadded_len);
-        needs_delete = true;
-    } else {
-        padded_code = code;
-    }
-
-    if needs_delete do defer delete(padded_code);
-
     info: vk.Shader_Module_Create_Info = {
         s_type = vk.Structure_Type.Shader_Module_Create_Info,
         code_size = len(code),
-        code = auto_cast &padded_code[0],
+        code = auto_cast &code[0],
     };
 
     shader_module: vk.Shader_Module;
@@ -119,12 +92,9 @@ is_device_suitable :: proc(device: vk.Physical_Device, surface: vk.Surface_KHR) 
         if !found do return false;
     }
 
-    swap_chain_support_details := query_swap_chain_support(device, surface);
-    { 
-        using swap_chain_support_details;
-        defer SwapChainSupportDetails_delete(&swap_chain_support_details);
-        if len(formats) == 0 || len(present_modes) == 0 do return false;
-    }
+    support_details := query_swap_chain_support(device, surface);
+    defer SwapChainSupportDetails_delete(&support_details);
+    if len(support_details.formats) == 0 || len(support_details.present_modes) == 0 do return false;
 
     return true;
 }
@@ -166,20 +136,15 @@ choose_swap_present_mode :: proc(available_present_modes: []vk.Present_Mode_KHR)
     best_mode := vk.Present_Mode_KHR.Fifo;
 
     for mode in available_present_modes {
-        if mode == vk.Present_Mode_KHR.Mailbox { // triple buffering
-            return mode;
-        } else if mode == vk.Present_Mode_KHR.Immediate {
-            best_mode = mode;
-        }
+        if mode == vk.Present_Mode_KHR.Mailbox do return mode; // triple buffering
+        else if mode == vk.Present_Mode_KHR.Immediate do best_mode = mode;
     }
 
     return best_mode;
 }
 
 choose_swap_extent :: proc(capabilities: ^vk.Surface_Capabilities_KHR, width: u32, height: u32) -> vk.Extent2D {
-    if capabilities.current_extent.width != bits.U32_MAX {
-        return capabilities.current_extent;
-    }
+    if capabilities.current_extent.width != bits.U32_MAX do return capabilities.current_extent;
 
     actual_extent := vk.Extent2D { width, height };
 
@@ -200,15 +165,20 @@ choose_swap_surface_format :: proc(available_formats: []vk.Surface_Format_KHR) -
     return available_formats[0];
 }
 
-WIDTH :: 800;
-HEIGHT :: 600;
+err_exit :: inline proc(message: string, return_code:int = -1) -> int {
+    fmt.println_err("Error:", message);
+    exit(return_code);
+    return -1;
+}
+
+check_vk_success :: inline proc (res: vk.Result, message: string) {
+    if res != vk.Result.Success do err_exit(message);
+}
 
 run :: proc() -> int {
     window := vulkan_init_helper(WIDTH, HEIGHT, WINDOW_TITLE);
-    if window == nil {
-        fmt.println_err("error: glfw could not create window");
-        return -1;
-    }
+    if window == nil do return err_exit("GLFW could not create window.");
+
     defer glfw.terminate();
     defer glfw.destroy_window(window);
 
@@ -303,10 +273,7 @@ run :: proc() -> int {
     // actually create the vulkan instance
     vulkan_instance : vk.Instance;
     result := vk.create_instance(&instance_create_info, nil, &vulkan_instance);
-    if result != vk.Result.Success {
-        fmt.println_err("Error: unable to create a Vulkan instance");
-        return -1;
-    }
+    check_vk_success(result, "Unable to create a Vulkan instance.");
 
     defer vk.destroy_instance(vulkan_instance, nil);
 
@@ -343,19 +310,15 @@ run :: proc() -> int {
             user_data = nil
         };
 
-        if vk.Result.Success != vk.create_debug_utils_messenger_ext(vulkan_instance, &messenger_create_info, nil, &callback) {
-            fmt.println_err("error: vkCreateDebugUtilsMessengerEXT failed");
-            return -1;
-        }
+        res := vk.create_debug_utils_messenger_ext(vulkan_instance, &messenger_create_info, nil, &callback);
+        check_vk_success(res, "vkCreateDebugUtilsMessengerEXT failed.");
     }
     defer if (callback != nil) do vk.destroy_debug_utils_messenger_ext(vulkan_instance, callback, nil);
 
     // create a surface
     surface: vk.Surface_KHR;
-    if vk.Result.Success != /*glfw*/CreateWindowSurface(vulkan_instance, window, nil, &surface) {
-        fmt.println_err("Error: failed to create window surface");
-        return -1;
-    }
+    check_vk_success(CreateWindowSurface(vulkan_instance, window, nil, &surface),
+        "Failed to create window surface.");
     defer vk.destroy_surface_khr(vulkan_instance, surface, nil);
 
     // pick a device
@@ -366,10 +329,7 @@ run :: proc() -> int {
     {
         device_count: u32 = ---;
         vk.enumerate_physical_devices(vulkan_instance, &device_count, nil);
-        if (device_count == 0) {
-            fmt.println_err("Error: No devices with Vulkan support found.");
-            return -1;
-        }
+        if (device_count == 0) do err_exit("No devices with Vulkan support found.");
         devices := make([]vk.Physical_Device, device_count);
         defer delete(devices);
         vk.enumerate_physical_devices(vulkan_instance, &device_count, &devices[0]);
@@ -387,7 +347,6 @@ run :: proc() -> int {
                 fmt.println("device:", physical_device_name);
             }
         }
-
 
         queue_family_count: u32 = ---;
         vk.get_physical_device_queue_family_properties(physical_device, &queue_family_count, nil);
@@ -413,14 +372,8 @@ run :: proc() -> int {
                 }
             }
         }
-        if !found_graphics {
-            fmt.println_err("Error: no Vulkan graphics queue found");
-            return -1;
-        }
-        if !found_present {
-            fmt.println_err("Error: no Vulkan present queue found");
-            return -1;
-        }
+        if !found_graphics do err_exit("No Vulkan graphics queue found.");;
+        if !found_present do err_exit("No Vulkan present queue found.");
 
         // specify queues to be created
         queue_create_infos: [dynamic]vk.Device_Queue_Create_Info;
@@ -475,10 +428,8 @@ run :: proc() -> int {
             device_create_info.enabled_layer_count = 0;
         }
 
-        if vk.Result.Success != vk.create_device(physical_device, &device_create_info, nil, &device) {
-            fmt.println_err("Error: failed to create a logical device");
-            return -1;
-        }
+        check_vk_success(vk.create_device(physical_device, &device_create_info, nil, &device),
+            "Failed to create a logical device.");
     }
     defer if (device != nil) do vk.destroy_device(device, nil);
 
@@ -488,7 +439,7 @@ run :: proc() -> int {
     present_queue: vk.Queue;
     vk.get_device_queue(device, present_family_index, 0, &present_queue);
 
-    // create swap chain
+    // Create swap chain
     swapchain: vk.Swapchain_KHR;
     swapchain_image_format: vk.Format;
     swapchain_extent: vk.Extent2D;
@@ -538,10 +489,8 @@ run :: proc() -> int {
             swapchain_create_info.queue_family_indices = nil;
         }
 
-        if vk.Result.Success != vk.create_swapchain_khr(device, &swapchain_create_info, nil, &swapchain) {
-            fmt.println_err("Error: failed to create swap chain");
-            return -1;
-        }
+        check_vk_success(vk.create_swapchain_khr(device, &swapchain_create_info, nil, &swapchain),
+            "Failed to create swap chain.");
     }
     defer vk.destroy_swapchain_khr(device, swapchain, nil);
 
@@ -586,11 +535,8 @@ run :: proc() -> int {
                     */
                 }
 
-                if vk.Result.Success != vk.create_image_view(device, &imageview_create_info, nil, &swapchain_imageviews[i]) {
-                    fmt.println_err("error: failed to create image view", i);
-                    return -1;
-                }
-
+                check_vk_success(vk.create_image_view(device, &imageview_create_info, nil, &swapchain_imageviews[i]),
+                    "Failed to create image view.");
             }
         }
     }
@@ -648,18 +594,16 @@ run :: proc() -> int {
             dependencies = &dependency,
         };
 
-        if vk.Result.Success != vk.create_render_pass(device, &render_pass_info, nil, &render_pass) {
-            fmt.println_err("Error: failed to create render pass");
-            return -1;
-        }
+        check_vk_success(vk.create_render_pass(device, &render_pass_info, nil, &render_pass),
+            "Failed to create render pass.");
     }
     defer vk.destroy_render_pass(device, render_pass, nil);
 
     // create graphics pipeline
     graphics_pipeline : vk.Pipeline;
     {
-        vert_filename := "vulkan_test/shaders/shader.vert.spv";
-        frag_filename := "vulkan_test/shaders/shader.frag.spv";
+        vert_filename := fmt.tprint(path.dir_name(#file), "/shaders/shader.vert.spv");
+        frag_filename := fmt.tprint(path.dir_name(#file), "/shaders/shader.frag.spv");
 
         vert_shader_code, success1 := os.read_entire_file(vert_filename);
         if !success1 {
@@ -814,10 +758,8 @@ run :: proc() -> int {
             push_constant_ranges = nil, // optional
         };
 
-        if vk.Result.Success != vk.create_pipeline_layout(device, &pipeline_layout_info, nil, &pipeline_layout) {
-            fmt.println_err("Error: failed to create pipeline layout");
-            return -1;
-        }
+        check_vk_success(vk.create_pipeline_layout(device, &pipeline_layout_info, nil, &pipeline_layout),
+            "Failed to create pipeline layout.");
 
         graphics_pipeline_info := vk.Graphics_Pipeline_Create_Info {
             s_type = vk.Structure_Type.Graphics_Pipeline_Create_Info,
@@ -840,10 +782,8 @@ run :: proc() -> int {
             base_pipeline_index = -1, //optional
         };
 
-        if vk.Result.Success != vk.create_graphics_pipelines(device, nil, 1, &graphics_pipeline_info, nil, &graphics_pipeline) {
-            fmt.println_err("Error: failed to create graphics pipeline");
-            return -1;
-        }
+        check_vk_success(vk.create_graphics_pipelines(device, nil, 1, &graphics_pipeline_info, nil, &graphics_pipeline),
+            "Failed to create graphics pipeline.");
     }
     defer vk.destroy_pipeline_layout(device, pipeline_layout, nil);
     defer vk.destroy_pipeline(device, graphics_pipeline, nil);
@@ -862,10 +802,9 @@ run :: proc() -> int {
                 height = swapchain_extent.height,
                 layers = 1, // number of images in image arrays
             };
-            if vk.Result.Success != vk.create_framebuffer(device, &framebuffer_info, nil, &swapchain_framebuffers[i]) {
-                fmt.println_err("Error: failed to create framebuffer");
-                return -1;
-            }
+
+            check_vk_success(vk.create_framebuffer(device, &framebuffer_info, nil, &swapchain_framebuffers[i]),
+                "Failed to create framebuffer.");
         }
     }
     defer for framebuffer in swapchain_framebuffers do vk.destroy_framebuffer(device, framebuffer, nil);
@@ -878,10 +817,8 @@ run :: proc() -> int {
             queue_family_index = graphics_family_index,
             //flags = 0, // optional
         };
-        if vk.Result.Success != vk.create_command_pool(device, &pool_info, nil, &command_pool) {
-            fmt.println_err("Error: Failed to create command pool.");
-            return -1;
-        }
+        check_vk_success(vk.create_command_pool(device, &pool_info, nil, &command_pool),
+            "Failed to create command pool.");
     }
     defer vk.destroy_command_pool(device, command_pool, nil);
 
@@ -897,10 +834,7 @@ run :: proc() -> int {
             command_buffer_count = u32(len(command_buffers)),
         };
 
-        if vk.Result.Success != vk.allocate_command_buffers(device, &alloc_info, &command_buffers[0]) {
-            fmt.println_err("Error: Failed to allocate command buffers.");
-            return -1;
-        }
+        check_vk_success(vk.allocate_command_buffers(device, &alloc_info, &command_buffers[0]), "Failed to allocate command buffers.");
     }
 
     // start command buffer recording
@@ -911,10 +845,8 @@ run :: proc() -> int {
                 flags = {vk.Command_Buffer_Usage_Flag.Simultaneous_Use},
                 inheritance_info = nil, // optional for secondary command buffers
             };
-            if vk.Result.Success != vk.begin_command_buffer(command_buffers[i], &begin_info) {
-                fmt.println_err("Error: Failed to begin recording command buffer", i);
-                return -1;
-            }
+            check_vk_success(vk.begin_command_buffer(command_buffers[i], &begin_info),
+                "Failed to begin recording command buffer");
 
             clear_value : vk.Clear_Value;
             clear_value.color.float32 = {0, 0, 0, 1};
@@ -943,50 +875,68 @@ run :: proc() -> int {
                 first_instance=0);
             vk.cmd_end_render_pass(command_buffers[i]);
 
-            if vk.Result.Success != vk.end_command_buffer(command_buffers[i]) {
-                fmt.println_err("Error: Failed to record command buffer", i);
+            check_vk_success(vk.end_command_buffer(command_buffers[i]), "Failed to record command buffer.");
+        }
+    }
+
+    image_available_semaphores : []vk.Semaphore;
+    render_finished_semaphores : []vk.Semaphore;
+    in_flight_fences : []vk.Fence;
+
+    { // create semaphores and fences
+        image_available_semaphores = make([]vk.Semaphore, MAX_FRAMES_IN_FLIGHT);
+        render_finished_semaphores = make([]vk.Semaphore, MAX_FRAMES_IN_FLIGHT);
+        in_flight_fences = make([]vk.Fence, MAX_FRAMES_IN_FLIGHT);
+
+        semaphore_info := vk.Semaphore_Create_Info { s_type = vk.Structure_Type.Semaphore_Create_Info };
+
+        fence_info := vk.Fence_Create_Info {
+            s_type = vk.Structure_Type.Fence_Create_Info,
+            flags = {vk.Fence_Create_Flag.Signaled},
+        };
+
+        for i in 0..MAX_FRAMES_IN_FLIGHT - 1 {
+            if vk.Result.Success != vk.create_semaphore(device, &semaphore_info, nil, &image_available_semaphores[i]) ||
+                vk.Result.Success != vk.create_semaphore(device, &semaphore_info, nil, &render_finished_semaphores[i]) ||
+                vk.Result.Success != vk.create_fence(device, &fence_info, nil, &in_flight_fences[i]) {
+                fmt.println_err("Error: Failed to create synchronization objects for frame", i);
                 return -1;
             }
         }
     }
-
-    image_available_semaphore, render_finished_semaphore : vk.Semaphore;
-    { // create semaphores
-        semaphore_info := vk.Semaphore_Create_Info { s_type = vk.Structure_Type.Semaphore_Create_Info };
-
-        if vk.Result.Success != vk.create_semaphore(device, &semaphore_info, nil, &image_available_semaphore) ||
-            vk.Result.Success != vk.create_semaphore(device, &semaphore_info, nil, &render_finished_semaphore) {
-            fmt.println_err("Error: Failed to create semaphores.");
-            return -1;
-        }
+    defer for i in 0..MAX_FRAMES_IN_FLIGHT - 1 {
+        vk.destroy_semaphore(device, image_available_semaphores[i], nil);
+        vk.destroy_semaphore(device, render_finished_semaphores[i], nil);
+        vk.destroy_fence(device, in_flight_fences[i], nil);
     }
-    defer vk.destroy_semaphore(device, image_available_semaphore, nil);
-    defer vk.destroy_semaphore(device, render_finished_semaphore, nil);
+
+    current_frame := 0;
 
     for !glfw.window_should_close(window) {
         frame_count += 1;
 
-        //window_width, window_height := glfw.get_window_size(window);
-
         current_time := glfw.get_time();
         delta_time := cast(f32)(current_time - last_time);
 
-        //glfw.swap_buffers(window);
         glfw.poll_events();
 
-        // ~~~~ DRAW FRAME
+        // Draw Frame
         {
+            // Wait for the previous frame rendering to our imageview to be finished
+            vk.wait_for_fences(device, 1, &in_flight_fences[current_frame], true, bits.U64_MAX);
+            vk.reset_fences(device, 1, &in_flight_fences[current_frame]);
+
             image_index : u32 = ---;
-            vk.acquire_next_image_khr(device, swapchain, bits.U64_MAX, image_available_semaphore, nil, &image_index);
+            vk.acquire_next_image_khr(device, swapchain, bits.U64_MAX, image_available_semaphores[current_frame], nil, &image_index);
 
-
-            wait_semaphores := [1]vk.Semaphore { image_available_semaphore };
+            wait_semaphores := [1]vk.Semaphore { image_available_semaphores[current_frame] };
 
             wait_stages : [1]vk.Pipeline_Stage_Flags = {
                 {vk.Pipeline_Stage_Flag.Color_Attachment_Output}
             };
 
-            signal_semaphores := [1]vk.Semaphore { render_finished_semaphore };
+            signal_semaphores := [1]vk.Semaphore { render_finished_semaphores[current_frame] };
+
             assert(len(signal_semaphores) == 1);
 
             submit_info := vk.Submit_Info {
@@ -996,31 +946,24 @@ run :: proc() -> int {
                 wait_dst_stage_mask = &wait_stages[0],
                 command_buffer_count = 1,
                 command_buffers = &command_buffers[image_index],
-
                 signal_semaphore_count = 1,
                 signal_semaphores = &signal_semaphores[0],
             };
 
-            if vk.Result.Success != vk.queue_submit(graphics_queue, 1, &submit_info, nil) {
-                fmt.println_err("Error: Failed to submit draw command buffer");
-                return -1;
-            }
+            check_vk_success(vk.queue_submit(graphics_queue, 1, &submit_info, in_flight_fences[current_frame]),
+                "Failed to submit draw command buffer.");
 
             swapchains := [1]vk.Swapchain_KHR {swapchain};
             present_info := vk.Present_Info_KHR {
                 s_type = vk.Structure_Type.Present_Info_KHR,
                 wait_semaphore_count = 1,
                 wait_semaphores = &signal_semaphores[0],
-
                 swapchain_count = 1,
                 swapchains = &swapchains[0],
-
                 image_indices = &image_index,
-
-                results = nil, // optional for many results
+                results = nil, // optional for obtaining individual results
             };
             vk.queue_present_khr(present_queue, &present_info);
-
         }
 
         vk.device_wait_idle(device);
@@ -1029,9 +972,8 @@ run :: proc() -> int {
 
         last_time = current_time;
         total_elapsed_time += f64(delta_time);
+        current_frame = (current_frame + 1) % MAX_FRAMES_IN_FLIGHT;
     }
-
-    fmt.println("rendered", frame_count, "frames in", total_elapsed_time);
 
     return 0;
 }

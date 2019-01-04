@@ -1,6 +1,6 @@
 package main
 
-import main_pkg "vulkan_test"
+import main_pkg "vulkan_triangle"
 
 import "core:os"
 
