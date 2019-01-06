@@ -4,3 +4,6 @@ msvc/
 *.bc
 *.ll
 *.obj
+*.exe
+*.pdb
+
