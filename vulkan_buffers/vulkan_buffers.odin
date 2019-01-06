@@ -49,10 +49,13 @@ Vertex_binding_description :: proc() -> vk.Vertex_Input_Binding_Description {
 }
 
 vertices := []Vertex {
-    {{0.0, -0.5}, {1.0, 0.0, 0.0}},
-    {{0.5, 0.5}, {0.0, 1.0, 0.0}},
-    {{-0.5, 0.5}, {0.0, 0.0, 1.0}}
+    {{-0.5, -0.5}, {1.0, 0.0, 0.0}},
+    {{0.5, -0.5}, {0.0, 1.0, 0.0}},
+    {{0.5, 0.5}, {0.0, 0.0, 1.0}},
+    {{-0.5, 0.5}, {1.0, 1.0, 1.0}}
 };
+
+indices := []u16 { 0, 1, 2, 2, 3, 0 };
 
 framebuffer_resize_callback :: proc "c" (window: glfw.Window_Handle, width, height: i32) {
     framebuffer_resized = true;
@@ -239,6 +242,8 @@ pipeline_layout : vk.Pipeline_Layout;
 framebuffer_resized := false;
 vertex_buffer: vk.Buffer;
 vertex_buffer_memory: vk.Device_Memory;
+index_buffer: vk.Buffer;
+index_buffer_memory: vk.Device_Memory;
 
 cleanup_swapchain :: proc() {
     for framebuffer in swapchain_framebuffers {
@@ -684,14 +689,20 @@ recreate_swapchain :: proc(window: glfw.Window_Handle) {
                 vertex_buffers := [1]vk.Buffer { vertex_buffer };
                 offsets := [1]vk.Device_Size { 0 };
                 vk.cmd_bind_vertex_buffers(command_buffers[i], 0, 1, &vertex_buffers[0], &offsets[0]);
+                vk.cmd_bind_index_buffer(command_buffers[i], index_buffer, 0, vk.Index_Type.Uint16);
             }
 
+            /*
             vk.cmd_draw(
                 command_buffer=command_buffers[i],
                 vertex_count=u32(len(vertices)),
                 instance_count=1,
                 first_vertex=0,
                 first_instance=0);
+            */
+
+            vk.cmd_draw_indexed(command_buffers[i], u32(len(indices)), 1, 0, 0, 0);
+
             vk.cmd_end_render_pass(command_buffers[i]);
 
             check_vk_success(vk.end_command_buffer(command_buffers[i]), "Failed to record command buffer.");
@@ -1039,8 +1050,19 @@ run :: proc() -> int {
             "Failed to create command pool.");
     }
     defer vk.destroy_command_pool(device, command_pool, nil);
-
+    
     // create vertex buffer
+    /* TODO @Perf
+        Driver developers recommend that you also store multiple buffers, like
+        the vertex and index buffer, into a single VkBuffer and use offsets in
+        commands like vkCmdBindVertexBuffers. The advantage is that your data
+        is more cache friendly in that case, because it's closer together. It
+        is even possible to reuse the same chunk of memory for multiple
+        resources if they are not used during the same render operations,
+        provided that their data is refreshed, of course. This is known as
+        aliasing and some Vulkan functions have explicit flags to specify that
+        you want to do this.
+    */
     {
         size := vk.Device_Size(size_of(vertices[0]) * len(vertices));
 
@@ -1072,6 +1094,41 @@ run :: proc() -> int {
             &vertex_buffer_memory);
 
         copy_buffer_and_wait(staging_buffer, vertex_buffer, size);
+    }
+
+
+    // create index buffer
+    {
+        size := vk.Device_Size(size_of(indices[0]) * len(indices));
+
+        staging_buffer : vk.Buffer = ---;
+        staging_buffer_memory : vk.Device_Memory = ---;
+        create_buffer(
+            size,
+            {vk.Buffer_Usage_Flag.Transfer_Src},
+            {vk.Memory_Property_Flag.Host_Visible, vk.Memory_Property_Flag.Host_Coherent},
+            &staging_buffer,
+            &staging_buffer_memory);
+
+        defer vk.destroy_buffer(device, staging_buffer, nil);
+        defer vk.free_memory(device, staging_buffer_memory, nil);
+
+        {
+            data: rawptr = ---;
+            vk.map_memory(device, staging_buffer_memory, 0, size, 0, &data);
+            defer vk.unmap_memory(device, staging_buffer_memory);
+
+            mem.copy(data, &indices[0], cast(int)size);
+        }
+
+        create_buffer(
+            size,
+            {vk.Buffer_Usage_Flag.Index_Buffer, vk.Buffer_Usage_Flag.Transfer_Dst},
+            {vk.Memory_Property_Flag.Device_Local},
+            &index_buffer,
+            &index_buffer_memory);
+
+        copy_buffer_and_wait(staging_buffer, index_buffer, size);
     }
 
     recreate_swapchain(window);
@@ -1200,6 +1257,9 @@ run :: proc() -> int {
 
     vk.destroy_buffer(device, vertex_buffer, nil);
     vk.free_memory(device, vertex_buffer_memory, nil);
+
+    vk.destroy_buffer(device, index_buffer, nil);
+    vk.free_memory(device, index_buffer_memory, nil);
 
     return 0;
 }
