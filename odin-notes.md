@@ -42,3 +42,11 @@ Camera_init :: proc(
 ```
 
 This would be a lot simpler if I could just put 45, 0.1, and 100 in the struct definition.
+
+    * Another error message without context:
+
+    ```
+vulkan_triangle.odin(594:48) Cannot assign value 'framebuffer_resize_callback' of type 'proc "cdecl" (Window_Handle, int, int)' to 'Framebuffer_Size_Proc' in argument
+    ```
+
+    The compiler knows that `Window_Size_Proc` is `proc "c" (window: Window_Handle, width, height: i32)`, but I don't without having to go look it up.

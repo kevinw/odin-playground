@@ -33,6 +33,10 @@ MAX_FRAMES_IN_FLIGHT :: 2;
 WIDTH :: 1280;
 HEIGHT :: 720;
 
+framebuffer_resize_callback :: proc "c" (window: glfw.Window_Handle, width, height: i32) {
+    framebuffer_resized = true;
+}
+
 key_callback :: proc "c" (window: glfw.Window_Handle, key: i32, scancode: i32, action: i32, mods: i32) {
     if action != i32(glfw.PRESS) do return;
 
@@ -52,7 +56,7 @@ vulkan_init_helper :: proc(resx := 1280, resy := 720, title := "Window title", s
     if samples > 0 do glfw_bindings.WindowHint(glfw_bindings.SAMPLES, i32(samples));
 
     glfw_bindings.WindowHint(i32(glfw.CLIENT_API), i32(glfw.NO_API));
-    glfw_bindings.WindowHint(i32(glfw.RESIZABLE), i32(glfw.FALSE));
+    glfw_bindings.WindowHint(i32(glfw.RESIZABLE), i32(glfw.TRUE));
 
     return glfw.create_window(int(resx), int(resy), title, nil, nil);
 }
@@ -143,10 +147,13 @@ choose_swap_present_mode :: proc(available_present_modes: []vk.Present_Mode_KHR)
     return best_mode;
 }
 
-choose_swap_extent :: proc(capabilities: ^vk.Surface_Capabilities_KHR, width: u32, height: u32) -> vk.Extent2D {
+choose_swap_extent :: proc(window: glfw.Window_Handle, capabilities: ^vk.Surface_Capabilities_KHR) -> vk.Extent2D {
     if capabilities.current_extent.width != bits.U32_MAX do return capabilities.current_extent;
 
-    actual_extent := vk.Extent2D { width, height };
+    width, height := glfw.get_framebuffer_size(window);
+    assert(width >= 0 && height >= 0);
+
+    actual_extent := vk.Extent2D { u32(width), u32(height) };
 
     return vk.Extent2D {
         max(capabilities.min_image_extent.width, min(capabilities.max_image_extent.width, actual_extent.width)),
@@ -175,274 +182,61 @@ check_vk_success :: inline proc (res: vk.Result, message: string) {
     if res != vk.Result.Success do err_exit(message);
 }
 
-run :: proc() -> int {
-    window := vulkan_init_helper(WIDTH, HEIGHT, WINDOW_TITLE);
-    if window == nil do return err_exit("GLFW could not create window.");
+// TODO: probably should be a struct
+device: vk.Device;
+swapchain: vk.Swapchain_KHR;
+physical_device: vk.Physical_Device;
+surface: vk.Surface_KHR;
+graphics_family_index: u32;
+present_family_index: u32;
+command_pool : vk.Command_Pool;
+command_buffers: []vk.Command_Buffer;
+render_pass : vk.Render_Pass;
+swapchain_images: []vk.Image;
+swapchain_framebuffers: []vk.Framebuffer;
+swapchain_imageviews: []vk.Image_View;
+swapchain_image_format: vk.Format;
+swapchain_extent: vk.Extent2D;
+graphics_pipeline : vk.Pipeline;
+pipeline_layout : vk.Pipeline_Layout;
+framebuffer_resized := false;
 
-    defer glfw.terminate();
-    defer glfw.destroy_window(window);
-
-    glfw.set_key_callback(window, key_callback);
-    glfw.set_input_mode(window, glfw.CURSOR, auto_cast glfw.CURSOR_DISABLED);
-
-    last_time := glfw.get_time();
-
-    total_elapsed_time : f64;
-    frame_count := 0;
-
-    when os.OS == "windows" {
-        vulkan_hmodule = win32.load_library_a("vulkan-1");
-        set_proc_address :: proc(p: rawptr, instance: vk.Instance, name: cstring) {
-            (cast(^rawptr)p)^ = win32.get_proc_address(vulkan_hmodule, name);
-        }
+cleanup_swapchain :: proc() {
+    for framebuffer in swapchain_framebuffers {
+        vk.destroy_framebuffer(device, framebuffer, nil);
     }
 
-    vk.load_loader_proc_addresses(set_proc_address);
-
-    // validation layers
-
-    validation_layers := []cstring {
-        "VK_LAYER_LUNARG_standard_validation"
-    };
-
-    if (VALIDATION_LAYERS_ENABLED) {
-        layer_count : u32 = ---;
-        vk.enumerate_instance_layer_properties(&layer_count, nil);
-
-        available_layers := make([]vk.Layer_Properties, layer_count);
-        defer delete(available_layers);
-
-        vk.enumerate_instance_layer_properties(&layer_count, &available_layers[0]);
-
-        for layer_name in validation_layers {
-            layer_found := false;
-            for _, i in available_layers {
-                layer_properties := &available_layers[i];
-                if cstring(&layer_properties.layer_name[0]) == layer_name do layer_found = true; // @Leak maybe?
-            }
-
-            if !layer_found {
-                fmt.println_err("validation layer not available:", layer_name);
-                return -1;
-            }
-        }
+    if len(command_buffers) > 0 {
+        vk.free_command_buffers(device, command_pool, u32(len(command_buffers)), &command_buffers[0]);
     }
 
-    // extensions
-
-    extension_count : u32 = ---;
-    vk.enumerate_instance_extension_properties(nil, &extension_count, nil);
-    fmt.println(extension_count, "extensions supported");
-
-    app_info := vk.Application_Info {
-        s_type = vk.Structure_Type.Application_Info,
-        application_name = "kev's vulkan test",
-        engine_name = "loco",
-        api_version = vk.API_VERSION_1_0,
-    };
-
-    glfw_extension_count : u32 = 0;
-    glfw_extensions := glfw_bindings.GetRequiredInstanceExtensions(&glfw_extension_count);
-
-    extensions : [dynamic]cstring;
-
-    for r in 0..int(glfw_extension_count) - 1 {
-        extension_cstring := mem.ptr_offset(glfw_extensions, r);
-        append(&extensions, cstring(extension_cstring^));
+    vk.destroy_pipeline(device, graphics_pipeline, nil);
+    vk.destroy_pipeline_layout(device, pipeline_layout, nil);
+    vk.destroy_render_pass(device, render_pass, nil);
+    for imageview in swapchain_imageviews {
+        vk.destroy_image_view(device, imageview, nil);
     }
 
-    if VALIDATION_LAYERS_ENABLED {
-        // Debug report extension when using validation layers
-        append(&extensions, cstring("VK_EXT_debug_utils"));
-    }
+    vk.destroy_swapchain_khr(device, swapchain, nil);
+}
 
-    instance_create_info := vk.Instance_Create_Info {
-        s_type = vk.Structure_Type.Instance_Create_Info,
-        application_info = &app_info,
-        enabled_extension_count = cast(u32)len(extensions),
-        enabled_extension_names = &extensions[0],
-    };
-
-    if (VALIDATION_LAYERS_ENABLED) {
-        instance_create_info.enabled_layer_count = u32(len(validation_layers));
-        instance_create_info.enabled_layer_names = cast(^cstring)(&validation_layers[0]);
-    } else {
-        instance_create_info.enabled_layer_count = 0;
-    }
-
-    // actually create the vulkan instance
-    vulkan_instance : vk.Instance;
-    result := vk.create_instance(&instance_create_info, nil, &vulkan_instance);
-    check_vk_success(result, "Unable to create a Vulkan instance.");
-
-    defer vk.destroy_instance(vulkan_instance, nil);
-
-    vk.load_instance_proc_addresses(vulkan_instance, set_proc_address);
-    vk.load_device_proc_addresses(vulkan_instance, set_proc_address);
-
-    callback : vk.Debug_Utils_Messenger_EXT;
-    if (VALIDATION_LAYERS_ENABLED) {
-        // register the debug messenger callback
-
-        debugCallback : vk.PFN_DebugUtilsMessengerCallbackEXT : proc "c" (
-            message_severity : vk.Debug_Utils_Message_Severity_Flags_EXT,
-            message_types : vk.Debug_Utils_Message_Type_Flags_EXT,
-            callback_data : ^vk.Debug_Utils_Messenger_Callback_Data_EXT,
-            user_data : rawptr
-        ) -> b32 {
-            fmt.println_err("validation layer:", callback_data.message);
-            return b32(false);
-        }
-
-        messenger_create_info: vk.Debug_Utils_Messenger_Create_Info_EXT = {
-            s_type = vk.Structure_Type.Debug_Utils_Messenger_Create_Info_EXT,
-            message_severity = {
-                vk.Debug_Utils_Message_Severity_Flag_EXT.Verbose,
-                vk.Debug_Utils_Message_Severity_Flag_EXT.Warning,
-                vk.Debug_Utils_Message_Severity_Flag_EXT.Error,
-            },
-            message_type = {
-                vk.Debug_Utils_Message_Type_Flag_EXT.General,
-                vk.Debug_Utils_Message_Type_Flag_EXT.Validation,
-                vk.Debug_Utils_Message_Type_Flag_EXT.Performance,
-            },
-            user_callback = debugCallback,
-            user_data = nil
-        };
-
-        res := vk.create_debug_utils_messenger_ext(vulkan_instance, &messenger_create_info, nil, &callback);
-        check_vk_success(res, "vkCreateDebugUtilsMessengerEXT failed.");
-    }
-    defer if (callback != nil) do vk.destroy_debug_utils_messenger_ext(vulkan_instance, callback, nil);
-
-    // create a surface
-    surface: vk.Surface_KHR;
-    check_vk_success(CreateWindowSurface(vulkan_instance, window, nil, &surface),
-        "Failed to create window surface.");
-    defer vk.destroy_surface_khr(vulkan_instance, surface, nil);
-
-    // pick a device
-    device: vk.Device;
-    graphics_family_index: u32;
-    present_family_index: u32;
-    physical_device: vk.Physical_Device;
+recreate_swapchain :: proc(window: glfw.Window_Handle) {
     {
-        device_count: u32 = ---;
-        vk.enumerate_physical_devices(vulkan_instance, &device_count, nil);
-        if (device_count == 0) do err_exit("No devices with Vulkan support found.");
-        devices := make([]vk.Physical_Device, device_count);
-        defer delete(devices);
-        vk.enumerate_physical_devices(vulkan_instance, &device_count, &devices[0]);
+        width, height: int;
+        for {
+            if width > 0 && height > 0 do break;
 
-        found_physical_device := false;
-        for _, i in devices {
-            physical_device_properties: vk.Physical_Device_Properties = ---;
-            vk.get_physical_device_properties(devices[i], &physical_device_properties);
-            physical_device_name := cstring(&physical_device_properties.device_name[0]);
-            if !found_physical_device && is_device_suitable(devices[i], surface) {
-                physical_device = devices[i];
-                found_physical_device = true;
-                fmt.println("device:", physical_device_name, "<-- USING THIS DEVICE");
-            } else {
-                fmt.println("device:", physical_device_name);
-            }
+            width, height = glfw.get_framebuffer_size(window);
+
+            glfw.wait_events();
         }
-
-        queue_family_count: u32 = ---;
-        vk.get_physical_device_queue_family_properties(physical_device, &queue_family_count, nil);
-        queue_family_properties := make([]vk.Queue_Family_Properties, queue_family_count);
-        defer delete(queue_family_properties);
-        vk.get_physical_device_queue_family_properties(physical_device, &queue_family_count, &queue_family_properties[0]);
-
-        found_graphics := false;
-        found_present := false;
-
-        for _, i in queue_family_properties {
-            if !found_graphics && queue_family_properties[i].queue_count > 0 && vk.Queue_Flag.Graphics in queue_family_properties[i].queue_flags {
-                graphics_family_index = u32(i);
-                found_graphics = true;
-            }
-
-            if !found_present {
-                present_support : b32 = false;
-                vk.get_physical_device_surface_support_khr(physical_device, u32(i), surface, &present_support);
-                if queue_family_properties[i].queue_count > 0 && present_support {
-                    present_family_index = u32(i);
-                    found_present = true;
-                }
-            }
-        }
-        if !found_graphics do err_exit("No Vulkan graphics queue found.");;
-        if !found_present do err_exit("No Vulkan present queue found.");
-
-        // specify queues to be created
-        queue_create_infos: [dynamic]vk.Device_Queue_Create_Info;
-        defer delete(queue_create_infos);
-        {
-            wanted_queues : [2]u32 = {graphics_family_index, present_family_index};
-
-            unique_queues: [dynamic]u32;
-            defer delete(unique_queues);
-
-            for wanted_queue in wanted_queues {
-                found := false; // TODO: make this a unique $T function
-                for seen in unique_queues {
-                    if seen == wanted_queue {
-                        found = true;
-                        break;
-                    }
-                }
-
-                if !found do append(&unique_queues, wanted_queue);
-            }
-
-            queue_priority : f32 = 1;
-            for queue_family in unique_queues {
-                append(&queue_create_infos, vk.Device_Queue_Create_Info {
-                    s_type = vk.Structure_Type.Device_Queue_Create_Info,
-                    queue_family_index = queue_family,
-                    queue_count = 1,
-                    queue_priorities = &queue_priority,
-                });
-            }
-
-        }
-
-        // Create the logical device
-        device_features := vk.Physical_Device_Features {};
-        device_create_info := vk.Device_Create_Info {
-            s_type = vk.Structure_Type.Device_Create_Info,
-            queue_create_infos = mem.raw_data(queue_create_infos),
-            queue_create_info_count = u32(len(queue_create_infos)),
-
-            enabled_extension_count = u32(len(required_device_extensions)),
-            enabled_extension_names = mem.raw_data(required_device_extensions),
-
-            enabled_features = &device_features,
-        };
-
-        if (VALIDATION_LAYERS_ENABLED) {
-            device_create_info.enabled_layer_count = u32(len(validation_layers));
-            device_create_info.enabled_layer_names = mem.raw_data(validation_layers);
-        } else {
-            device_create_info.enabled_layer_count = 0;
-        }
-
-        check_vk_success(vk.create_device(physical_device, &device_create_info, nil, &device),
-            "Failed to create a logical device.");
     }
-    defer if (device != nil) do vk.destroy_device(device, nil);
 
-    graphics_queue: vk.Queue;
-    vk.get_device_queue(device, graphics_family_index, 0, &graphics_queue);
+    vk.device_wait_idle(device);
 
-    present_queue: vk.Queue;
-    vk.get_device_queue(device, present_family_index, 0, &present_queue);
+    cleanup_swapchain();
 
     // Create swap chain
-    swapchain: vk.Swapchain_KHR;
-    swapchain_image_format: vk.Format;
-    swapchain_extent: vk.Extent2D;
     {
         swap_chain_support := query_swap_chain_support(physical_device, surface);
         using swap_chain_support;
@@ -451,7 +245,8 @@ run :: proc() -> int {
 
         surface_format := choose_swap_surface_format(formats);
         present_mode := choose_swap_present_mode(present_modes);
-        swapchain_extent = choose_swap_extent(&capabilities, WIDTH, HEIGHT);
+
+        swapchain_extent = choose_swap_extent(window, &capabilities);
 
         image_count := capabilities.min_image_count + 1;
         if capabilities.max_image_count > 0 && image_count > capabilities.max_image_count { // zero means no limit
@@ -492,12 +287,8 @@ run :: proc() -> int {
         check_vk_success(vk.create_swapchain_khr(device, &swapchain_create_info, nil, &swapchain),
             "Failed to create swap chain.");
     }
-    defer vk.destroy_swapchain_khr(device, swapchain, nil);
 
     // retrieve swapchain images
-    swapchain_images: []vk.Image;
-    swapchain_framebuffers: []vk.Framebuffer;
-    swapchain_imageviews: []vk.Image_View;
     {
         image_count: u32 = ---;
         vk.get_swapchain_images_khr(device, swapchain, &image_count, nil);
@@ -540,11 +331,8 @@ run :: proc() -> int {
             }
         }
     }
-    defer for _, i in swapchain_imageviews do vk.destroy_image_view(device, swapchain_imageviews[i], nil);
 
     // create render pass
-    render_pass : vk.Render_Pass;
-    pipeline_layout : vk.Pipeline_Layout;
     {
         dependency := vk.Subpass_Dependency {
             src_subpass = vk.SUBPASS_EXTERNAL,
@@ -597,38 +385,24 @@ run :: proc() -> int {
         check_vk_success(vk.create_render_pass(device, &render_pass_info, nil, &render_pass),
             "Failed to create render pass.");
     }
-    defer vk.destroy_render_pass(device, render_pass, nil);
 
     // create graphics pipeline
-    graphics_pipeline : vk.Pipeline;
     {
         vert_filename := fmt.tprint(path.dir_name(#file), "/shaders/shader.vert.spv");
         frag_filename := fmt.tprint(path.dir_name(#file), "/shaders/shader.frag.spv");
 
         vert_shader_code, success1 := os.read_entire_file(vert_filename);
-        if !success1 {
-            fmt.println_err("error: could not read", vert_filename);
-            return -1;
-        }
+        if !success1 do err_exit("Could not read vertex shader");
 
         frag_shader_code, success2 := os.read_entire_file(frag_filename);
-        if !success2 {
-            fmt.println_err("Error: Could not read", frag_filename);
-            return -1;
-        }
+        if !success2 do err_exit("Error: Could not fragment shader");
 
         success3, vert_shader_module := create_shader_module(device, vert_shader_code);
-        if success3 != vk.Result.Success {
-            fmt.println_err("Error: Could not create a shader module for", vert_filename);
-            return -1;
-        }
+        check_vk_success(success3, "Could not create a shader module for the vertex shader.");
         defer vk.destroy_shader_module(device, vert_shader_module, nil);
 
         res4, frag_shader_module := create_shader_module(device, frag_shader_code);
-        if res4 != vk.Result.Success {
-            fmt.println_err("Error: Could not create a shader module for", frag_filename);
-            return -1;
-        }
+        check_vk_success(res4, "Could not create a shader module for the fragment shader.");
         defer vk.destroy_shader_module(device, frag_shader_module, nil);
 
         vert_shader_stage_info := vk.Pipeline_Shader_Stage_Create_Info {
@@ -785,8 +559,6 @@ run :: proc() -> int {
         check_vk_success(vk.create_graphics_pipelines(device, nil, 1, &graphics_pipeline_info, nil, &graphics_pipeline),
             "Failed to create graphics pipeline.");
     }
-    defer vk.destroy_pipeline_layout(device, pipeline_layout, nil);
-    defer vk.destroy_pipeline(device, graphics_pipeline, nil);
 
     // create framebuffers
     {
@@ -807,23 +579,8 @@ run :: proc() -> int {
                 "Failed to create framebuffer.");
         }
     }
-    defer for framebuffer in swapchain_framebuffers do vk.destroy_framebuffer(device, framebuffer, nil);
-
-    // create command pool
-    command_pool : vk.Command_Pool;
-    {
-        pool_info := vk.Command_Pool_Create_Info {
-            s_type = vk.Structure_Type.Command_Pool_Create_Info,
-            queue_family_index = graphics_family_index,
-            //flags = 0, // optional
-        };
-        check_vk_success(vk.create_command_pool(device, &pool_info, nil, &command_pool),
-            "Failed to create command pool.");
-    }
-    defer vk.destroy_command_pool(device, command_pool, nil);
 
     // create command buffers
-    command_buffers: []vk.Command_Buffer;
     {
         command_buffers = make([]vk.Command_Buffer, len(swapchain_framebuffers));
 
@@ -879,6 +636,284 @@ run :: proc() -> int {
         }
     }
 
+}
+
+run :: proc() -> int {
+    window := vulkan_init_helper(WIDTH, HEIGHT, WINDOW_TITLE);
+    if window == nil do return err_exit("GLFW could not create window.");
+
+    defer glfw.terminate();
+    defer glfw.destroy_window(window);
+
+    glfw.set_framebuffer_size_callback(window, framebuffer_resize_callback);
+    glfw.set_key_callback(window, key_callback);
+    //glfw.set_input_mode(window, glfw.CURSOR, auto_cast glfw.CURSOR_DISABLED);
+
+    last_time := glfw.get_time();
+
+    total_elapsed_time : f64;
+    frame_count := 0;
+
+    when os.OS == "windows" {
+        vulkan_hmodule = win32.load_library_a("vulkan-1");
+        set_proc_address :: proc(p: rawptr, instance: vk.Instance, name: cstring) {
+            (cast(^rawptr)p)^ = win32.get_proc_address(vulkan_hmodule, name);
+        }
+    }
+
+    vk.load_loader_proc_addresses(set_proc_address);
+
+    // validation layers
+
+    validation_layers := []cstring {
+        "VK_LAYER_LUNARG_standard_validation"
+    };
+
+    if (VALIDATION_LAYERS_ENABLED) {
+        layer_count : u32 = ---;
+        vk.enumerate_instance_layer_properties(&layer_count, nil);
+
+        available_layers := make([]vk.Layer_Properties, layer_count);
+        defer delete(available_layers);
+
+        vk.enumerate_instance_layer_properties(&layer_count, &available_layers[0]);
+
+        for layer_name in validation_layers {
+            layer_found := false;
+            for _, i in available_layers {
+                layer_properties := &available_layers[i];
+                if cstring(&layer_properties.layer_name[0]) == layer_name do layer_found = true; // @Leak maybe?
+            }
+
+            if !layer_found {
+                fmt.println_err("validation layer not available:", layer_name);
+                return -1;
+            }
+        }
+    }
+
+    // extensions
+
+    extension_count : u32 = ---;
+    vk.enumerate_instance_extension_properties(nil, &extension_count, nil);
+    fmt.println(extension_count, "extensions supported");
+
+    app_info := vk.Application_Info {
+        s_type = vk.Structure_Type.Application_Info,
+        application_name = "kev's vulkan test",
+        engine_name = "loco",
+        api_version = vk.API_VERSION_1_0,
+    };
+
+    glfw_extension_count : u32 = 0;
+    glfw_extensions := glfw_bindings.GetRequiredInstanceExtensions(&glfw_extension_count);
+
+    extensions : [dynamic]cstring;
+
+    for r in 0..int(glfw_extension_count) - 1 {
+        extension_cstring := mem.ptr_offset(glfw_extensions, r);
+        append(&extensions, cstring(extension_cstring^));
+    }
+
+    if VALIDATION_LAYERS_ENABLED {
+        // Debug report extension when using validation layers
+        append(&extensions, cstring("VK_EXT_debug_utils"));
+    }
+
+    instance_create_info := vk.Instance_Create_Info {
+        s_type = vk.Structure_Type.Instance_Create_Info,
+        application_info = &app_info,
+        enabled_extension_count = cast(u32)len(extensions),
+        enabled_extension_names = &extensions[0],
+    };
+
+    if (VALIDATION_LAYERS_ENABLED) {
+        instance_create_info.enabled_layer_count = u32(len(validation_layers));
+        instance_create_info.enabled_layer_names = cast(^cstring)(&validation_layers[0]);
+    } else {
+        instance_create_info.enabled_layer_count = 0;
+    }
+
+    // actually create the vulkan instance
+    vulkan_instance : vk.Instance;
+    result := vk.create_instance(&instance_create_info, nil, &vulkan_instance);
+    check_vk_success(result, "Unable to create a Vulkan instance.");
+
+    defer vk.destroy_instance(vulkan_instance, nil);
+
+    vk.load_instance_proc_addresses(vulkan_instance, set_proc_address);
+    vk.load_device_proc_addresses(vulkan_instance, set_proc_address);
+
+    callback : vk.Debug_Utils_Messenger_EXT;
+    if (VALIDATION_LAYERS_ENABLED) {
+        // register the debug messenger callback
+
+        debugCallback : vk.PFN_DebugUtilsMessengerCallbackEXT : proc "c" (
+            message_severity : vk.Debug_Utils_Message_Severity_Flags_EXT,
+            message_types : vk.Debug_Utils_Message_Type_Flags_EXT,
+            callback_data : ^vk.Debug_Utils_Messenger_Callback_Data_EXT,
+            user_data : rawptr
+        ) -> b32 {
+            fmt.println_err("validation layer:", callback_data.message);
+            return b32(false);
+        }
+
+        messenger_create_info: vk.Debug_Utils_Messenger_Create_Info_EXT = {
+            s_type = vk.Structure_Type.Debug_Utils_Messenger_Create_Info_EXT,
+            message_severity = {
+                vk.Debug_Utils_Message_Severity_Flag_EXT.Verbose,
+                vk.Debug_Utils_Message_Severity_Flag_EXT.Warning,
+                vk.Debug_Utils_Message_Severity_Flag_EXT.Error,
+            },
+            message_type = {
+                vk.Debug_Utils_Message_Type_Flag_EXT.General,
+                vk.Debug_Utils_Message_Type_Flag_EXT.Validation,
+                vk.Debug_Utils_Message_Type_Flag_EXT.Performance,
+            },
+            user_callback = debugCallback,
+            user_data = nil
+        };
+
+        res := vk.create_debug_utils_messenger_ext(vulkan_instance, &messenger_create_info, nil, &callback);
+        check_vk_success(res, "vkCreateDebugUtilsMessengerEXT failed.");
+    }
+    defer if (callback != nil) do vk.destroy_debug_utils_messenger_ext(vulkan_instance, callback, nil);
+
+    // create a surface
+    check_vk_success(CreateWindowSurface(vulkan_instance, window, nil, &surface),
+        "Failed to create window surface.");
+    defer vk.destroy_surface_khr(vulkan_instance, surface, nil);
+
+    // pick a device
+    {
+        device_count: u32 = ---;
+        vk.enumerate_physical_devices(vulkan_instance, &device_count, nil);
+        if (device_count == 0) do err_exit("No devices with Vulkan support found.");
+        devices := make([]vk.Physical_Device, device_count);
+        defer delete(devices);
+        vk.enumerate_physical_devices(vulkan_instance, &device_count, &devices[0]);
+
+        found_physical_device := false;
+        for _, i in devices {
+            physical_device_properties: vk.Physical_Device_Properties = ---;
+            vk.get_physical_device_properties(devices[i], &physical_device_properties);
+            physical_device_name := cstring(&physical_device_properties.device_name[0]);
+            if !found_physical_device && is_device_suitable(devices[i], surface) {
+                physical_device = devices[i];
+                found_physical_device = true;
+                fmt.println("device:", physical_device_name, "<-- USING THIS DEVICE");
+            } else {
+                fmt.println("device:", physical_device_name);
+            }
+        }
+
+        queue_family_count: u32 = ---;
+        vk.get_physical_device_queue_family_properties(physical_device, &queue_family_count, nil);
+        queue_family_properties := make([]vk.Queue_Family_Properties, queue_family_count);
+        defer delete(queue_family_properties);
+        vk.get_physical_device_queue_family_properties(physical_device, &queue_family_count, &queue_family_properties[0]);
+
+        found_graphics := false;
+        found_present := false;
+
+        for _, i in queue_family_properties {
+            if !found_graphics && queue_family_properties[i].queue_count > 0 && vk.Queue_Flag.Graphics in queue_family_properties[i].queue_flags {
+                graphics_family_index = u32(i);
+                found_graphics = true;
+            }
+
+            if !found_present {
+                present_support : b32 = false;
+                vk.get_physical_device_surface_support_khr(physical_device, u32(i), surface, &present_support);
+                if queue_family_properties[i].queue_count > 0 && present_support {
+                    present_family_index = u32(i);
+                    found_present = true;
+                }
+            }
+        }
+        if !found_graphics do err_exit("No Vulkan graphics queue found.");;
+        if !found_present do err_exit("No Vulkan present queue found.");
+
+        // specify queues to be created
+        queue_create_infos: [dynamic]vk.Device_Queue_Create_Info;
+        defer delete(queue_create_infos);
+        {
+            wanted_queues : [2]u32 = {graphics_family_index, present_family_index};
+
+            unique_queues: [dynamic]u32;
+            defer delete(unique_queues);
+
+            for wanted_queue in wanted_queues {
+                found := false; // TODO: make this a unique $T function
+                for seen in unique_queues {
+                    if seen == wanted_queue {
+                        found = true;
+                        break;
+                    }
+                }
+
+                if !found do append(&unique_queues, wanted_queue);
+            }
+
+            queue_priority : f32 = 1;
+            for queue_family in unique_queues {
+                append(&queue_create_infos, vk.Device_Queue_Create_Info {
+                    s_type = vk.Structure_Type.Device_Queue_Create_Info,
+                    queue_family_index = queue_family,
+                    queue_count = 1,
+                    queue_priorities = &queue_priority,
+                });
+            }
+
+        }
+
+        // Create the logical device
+        device_features := vk.Physical_Device_Features {};
+        device_create_info := vk.Device_Create_Info {
+            s_type = vk.Structure_Type.Device_Create_Info,
+            queue_create_infos = mem.raw_data(queue_create_infos),
+            queue_create_info_count = u32(len(queue_create_infos)),
+
+            enabled_extension_count = u32(len(required_device_extensions)),
+            enabled_extension_names = mem.raw_data(required_device_extensions),
+
+            enabled_features = &device_features,
+        };
+
+        if (VALIDATION_LAYERS_ENABLED) {
+            device_create_info.enabled_layer_count = u32(len(validation_layers));
+            device_create_info.enabled_layer_names = mem.raw_data(validation_layers);
+        } else {
+            device_create_info.enabled_layer_count = 0;
+        }
+
+        check_vk_success(vk.create_device(physical_device, &device_create_info, nil, &device),
+            "Failed to create a logical device.");
+    }
+    defer if (device != nil) do vk.destroy_device(device, nil);
+
+    graphics_queue: vk.Queue;
+    vk.get_device_queue(device, graphics_family_index, 0, &graphics_queue);
+
+    present_queue: vk.Queue;
+    vk.get_device_queue(device, present_family_index, 0, &present_queue);
+
+
+
+    // create command pool
+    {
+        pool_info := vk.Command_Pool_Create_Info {
+            s_type = vk.Structure_Type.Command_Pool_Create_Info,
+            queue_family_index = graphics_family_index,
+            //flags = 0, // optional
+        };
+        check_vk_success(vk.create_command_pool(device, &pool_info, nil, &command_pool),
+            "Failed to create command pool.");
+    }
+    defer vk.destroy_command_pool(device, command_pool, nil);
+
+    recreate_swapchain(window);
+
     image_available_semaphores : []vk.Semaphore;
     render_finished_semaphores : []vk.Semaphore;
     in_flight_fences : []vk.Fence;
@@ -924,49 +959,70 @@ run :: proc() -> int {
         {
             // Wait for the previous frame rendering to our imageview to be finished
             vk.wait_for_fences(device, 1, &in_flight_fences[current_frame], true, bits.U64_MAX);
-            vk.reset_fences(device, 1, &in_flight_fences[current_frame]);
 
             image_index : u32 = ---;
-            vk.acquire_next_image_khr(device, swapchain, bits.U64_MAX, image_available_semaphores[current_frame], nil, &image_index);
+            wait_for_next_frame := false;
 
-            wait_semaphores := [1]vk.Semaphore { image_available_semaphores[current_frame] };
+            {
+                swapchain_result := vk.acquire_next_image_khr(device, swapchain, bits.U64_MAX, image_available_semaphores[current_frame], nil, &image_index);
+                if swapchain_result == vk.Result.Error_Out_Of_Date_KHR {
+                    fmt.println("recreating swapchain because we received Error_Out_Of_Date_KHR from aquire_next_image_khr");
+                    recreate_swapchain(window);
+                    wait_for_next_frame = true;
+                } else if swapchain_result != vk.Result.Success && swapchain_result != vk.Result.Suboptimal_KHR {
+                    err_exit("Failed to acquire swap chain image.");
+                }
+            }
 
-            wait_stages : [1]vk.Pipeline_Stage_Flags = {
-                {vk.Pipeline_Stage_Flag.Color_Attachment_Output}
-            };
+            if !wait_for_next_frame {
+                wait_semaphores := [1]vk.Semaphore { image_available_semaphores[current_frame] };
 
-            signal_semaphores := [1]vk.Semaphore { render_finished_semaphores[current_frame] };
+                wait_stages : [1]vk.Pipeline_Stage_Flags = {
+                    {vk.Pipeline_Stage_Flag.Color_Attachment_Output}
+                };
 
-            assert(len(signal_semaphores) == 1);
+                signal_semaphores := [1]vk.Semaphore { render_finished_semaphores[current_frame] };
 
-            submit_info := vk.Submit_Info {
-                s_type = vk.Structure_Type.Submit_Info,
-                wait_semaphore_count = 1,
-                wait_semaphores = &wait_semaphores[0],
-                wait_dst_stage_mask = &wait_stages[0],
-                command_buffer_count = 1,
-                command_buffers = &command_buffers[image_index],
-                signal_semaphore_count = 1,
-                signal_semaphores = &signal_semaphores[0],
-            };
+                assert(len(signal_semaphores) == 1);
 
-            check_vk_success(vk.queue_submit(graphics_queue, 1, &submit_info, in_flight_fences[current_frame]),
-                "Failed to submit draw command buffer.");
+                submit_info := vk.Submit_Info {
+                    s_type = vk.Structure_Type.Submit_Info,
+                    wait_semaphore_count = 1,
+                    wait_semaphores = &wait_semaphores[0],
+                    wait_dst_stage_mask = &wait_stages[0],
+                    command_buffer_count = 1,
+                    command_buffers = &command_buffers[image_index],
+                    signal_semaphore_count = 1,
+                    signal_semaphores = &signal_semaphores[0],
+                };
 
-            swapchains := [1]vk.Swapchain_KHR {swapchain};
-            present_info := vk.Present_Info_KHR {
-                s_type = vk.Structure_Type.Present_Info_KHR,
-                wait_semaphore_count = 1,
-                wait_semaphores = &signal_semaphores[0],
-                swapchain_count = 1,
-                swapchains = &swapchains[0],
-                image_indices = &image_index,
-                results = nil, // optional for obtaining individual results
-            };
-            vk.queue_present_khr(present_queue, &present_info);
+                vk.reset_fences(device, 1, &in_flight_fences[current_frame]);
+                check_vk_success(vk.queue_submit(graphics_queue, 1, &submit_info, in_flight_fences[current_frame]),
+                    "Failed to submit draw command buffer.");
+
+                swapchains := [1]vk.Swapchain_KHR {swapchain};
+                present_info := vk.Present_Info_KHR {
+                    s_type = vk.Structure_Type.Present_Info_KHR,
+                    wait_semaphore_count = 1,
+                    wait_semaphores = &signal_semaphores[0],
+                    swapchain_count = 1,
+                    swapchains = &swapchains[0],
+                    image_indices = &image_index,
+                    results = nil, // optional for obtaining individual results
+                };
+                {
+                    present_result := vk.queue_present_khr(present_queue, &present_info);
+                    if present_result == vk.Result.Error_Out_Of_Date_KHR
+                        || result == vk.Result.Suboptimal_KHR
+                        || framebuffer_resized
+                    {
+                        fmt.println("recreating swapchain because of queue_present_khr result");
+                        framebuffer_resized = false;
+                        recreate_swapchain(window);
+                    }
+                }
+            }
         }
-
-        vk.device_wait_idle(device);
 
         glfw.calculate_frame_timings(window);
 
@@ -974,6 +1030,11 @@ run :: proc() -> int {
         total_elapsed_time += f64(delta_time);
         current_frame = (current_frame + 1) % MAX_FRAMES_IN_FLIGHT;
     }
+
+    // wait for frames to finish before cleanup
+    vk.wait_for_fences(device, cast(u32)len(in_flight_fences), &in_flight_fences[0], true, bits.U64_MAX);
+
+    cleanup_swapchain();
 
     return 0;
 }
