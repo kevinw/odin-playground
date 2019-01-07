@@ -57,6 +57,10 @@ vertices := []Vertex {
 
 indices := []u16 { 0, 1, 2, 2, 3, 0 };
 
+Uniform_Buffer_Object :: struct #packed {
+    model, view, proj: math.Mat4,
+}
+
 framebuffer_resize_callback :: proc "c" (window: glfw.Window_Handle, width, height: i32) {
     framebuffer_resized = true;
 }
@@ -238,12 +242,19 @@ swapchain_imageviews: []vk.Image_View;
 swapchain_image_format: vk.Format;
 swapchain_extent: vk.Extent2D;
 graphics_pipeline : vk.Pipeline;
+
 pipeline_layout : vk.Pipeline_Layout;
 framebuffer_resized := false;
 vertex_buffer: vk.Buffer;
 vertex_buffer_memory: vk.Device_Memory;
 index_buffer: vk.Buffer;
 index_buffer_memory: vk.Device_Memory;
+uniform_buffers: []vk.Buffer;
+uniform_buffers_memory: []vk.Device_Memory;
+
+descriptor_set_layout: vk.Descriptor_Set_Layout;
+descriptor_pool: vk.Descriptor_Pool;
+descriptor_sets: []vk.Descriptor_Set;
 
 cleanup_swapchain :: proc() {
     for framebuffer in swapchain_framebuffers {
@@ -264,7 +275,7 @@ cleanup_swapchain :: proc() {
     vk.destroy_swapchain_khr(device, swapchain, nil);
 }
 
-recreate_swapchain :: proc(window: glfw.Window_Handle) {
+recreate_swapchain :: proc(window: glfw.Window_Handle, first_run:bool = false) {
     {
         width, height: int;
         for {
@@ -430,6 +441,98 @@ recreate_swapchain :: proc(window: glfw.Window_Handle) {
             "Failed to create render pass.");
     }
 
+    // create uniform buffers
+    if (first_run) {
+        uniform_buffers = make([]vk.Buffer, len(swapchain_images));
+        uniform_buffers_memory = make([]vk.Device_Memory, len(swapchain_images));
+
+        for _, i in swapchain_images {
+            create_buffer(
+                size_of(Uniform_Buffer_Object),
+                {vk.Buffer_Usage_Flag.Uniform_Buffer},
+                {vk.Memory_Property_Flag.Host_Visible, vk.Memory_Property_Flag.Host_Coherent},
+                &uniform_buffers[i],
+                &uniform_buffers_memory[i]);
+        }
+    }
+
+    // create descriptor set layout
+    if (first_run) {
+        ubo_layout_binding := vk.Descriptor_Set_Layout_Binding {
+            binding = 0,
+            descriptor_type = vk.Descriptor_Type.Uniform_Buffer,
+            descriptor_count = 1,
+            stage_flags = {vk.Shader_Stage_Flag.Vertex},
+        };
+
+        layout_info := vk.Descriptor_Set_Layout_Create_Info {
+            s_type = vk.Structure_Type.Descriptor_Set_Layout_Create_Info,
+            binding_count = 1,
+            bindings = &ubo_layout_binding,
+        };
+
+        check_vk_success(vk.create_descriptor_set_layout(device, &layout_info, nil, &descriptor_set_layout),
+            "Failed to create descriptor set layout.");
+    }
+
+    // create descriptor pool and sets
+    if (first_run) {
+        num_swapchain_images := u32(len(swapchain_images));
+
+        pool_size := vk.Descriptor_Pool_Size {
+            type = vk.Descriptor_Type.Uniform_Buffer,
+            descriptor_count = num_swapchain_images,
+        };
+
+        pool_info := vk.Descriptor_Pool_Create_Info {
+            s_type = vk.Structure_Type.Descriptor_Pool_Create_Info,
+            pool_size_count = 1,
+            pool_sizes = &pool_size,
+            max_sets = num_swapchain_images,
+        };
+        check_vk_success(vk.create_descriptor_pool(device, &pool_info, nil, &descriptor_pool),
+            "Failed to create descriptor pool.");
+
+        layouts := make([]vk.Descriptor_Set_Layout, num_swapchain_images);
+        defer delete(layouts);
+        for i := u32(0); i < num_swapchain_images; i += 1 {
+            layouts[i] = descriptor_set_layout;
+        }
+
+        alloc_info := vk.Descriptor_Set_Allocate_Info {
+            s_type = vk.Structure_Type.Descriptor_Set_Allocate_Info,
+            descriptor_pool = descriptor_pool,
+            descriptor_set_count = num_swapchain_images,
+            set_layouts = &layouts[0],
+        };
+
+        descriptor_sets = make([]vk.Descriptor_Set, num_swapchain_images);
+        check_vk_success(vk.allocate_descriptor_sets(device, &alloc_info, &descriptor_sets[0]),
+            "Failed to allocate descriptor sets.");
+
+        for i := u32(0); i < num_swapchain_images; i += 1 {
+            buffer_info := vk.Descriptor_Buffer_Info {
+                buffer = uniform_buffers[i],
+                offset = 0,
+                range = size_of(Uniform_Buffer_Object),
+            };
+
+            descriptor_write := vk.Write_Descriptor_Set {
+                s_type = vk.Structure_Type.Write_Descriptor_Set,
+                dst_set = descriptor_sets[i],
+                dst_binding = 0,
+                dst_array_element = 0,
+                descriptor_type = vk.Descriptor_Type.Uniform_Buffer,
+                descriptor_count = 1,
+                buffer_info = &buffer_info,
+                image_info = nil,
+                texel_buffer_view = nil,
+            };
+
+            vk.update_descriptor_sets(device, 1, &descriptor_write, 0, nil);
+        }
+    }
+
     // create graphics pipeline
     {
         vert_filename := fmt.tprint(path.dir_name(#file), "/shaders/shader.vert.spv");
@@ -519,7 +622,7 @@ recreate_swapchain :: proc(window: glfw.Window_Handle) {
             //polygon_mode = vk.Polygon_Mode.Point, // requires gpu feature
             line_width = 1,
             cull_mode = {vk.Cull_Mode_Flag.Back},
-            front_face = vk.Front_Face.Clockwise,
+            front_face = vk.Front_Face.Counter_Clockwise,
 
             depth_bias_enable = false,
             depth_bias_constant_factor = 0, //optional
@@ -586,8 +689,8 @@ recreate_swapchain :: proc(window: glfw.Window_Handle) {
 
         pipeline_layout_info := vk.Pipeline_Layout_Create_Info {
             s_type = vk.Structure_Type.Pipeline_Layout_Create_Info,
-            set_layout_count = 0, // optional
-            set_layouts = nil, // optional
+            set_layout_count = 1,
+            set_layouts = &descriptor_set_layout,
             push_constant_range_count = 0, //optional
             push_constant_ranges = nil, // optional
         };
@@ -700,6 +803,8 @@ recreate_swapchain :: proc(window: glfw.Window_Handle) {
                 first_vertex=0,
                 first_instance=0);
             */
+
+            vk.cmd_bind_descriptor_sets(command_buffers[i], vk.Pipeline_Bind_Point.Graphics, pipeline_layout, 0, 1, &descriptor_sets[i], 0, nil);
 
             vk.cmd_draw_indexed(command_buffers[i], u32(len(indices)), 1, 0, 0, 0);
 
@@ -1050,7 +1155,7 @@ run :: proc() -> int {
             "Failed to create command pool.");
     }
     defer vk.destroy_command_pool(device, command_pool, nil);
-    
+
     // create vertex buffer
     /* TODO @Perf
         Driver developers recommend that you also store multiple buffers, like
@@ -1131,7 +1236,7 @@ run :: proc() -> int {
         copy_buffer_and_wait(staging_buffer, index_buffer, size);
     }
 
-    recreate_swapchain(window);
+    recreate_swapchain(window, true);
 
     image_available_semaphores : []vk.Semaphore;
     render_finished_semaphores : []vk.Semaphore;
@@ -1165,6 +1270,7 @@ run :: proc() -> int {
     }
 
     current_frame := 0;
+    start_time := glfw.get_time();
 
     for !glfw.window_should_close(window) {
         frame_count += 1;
@@ -1203,6 +1309,30 @@ run :: proc() -> int {
                 signal_semaphores := [1]vk.Semaphore { render_finished_semaphores[current_frame] };
 
                 assert(len(signal_semaphores) == 1);
+
+                { // update uniform buffer
+                    // TODO: @Perf this is not the most efficient way to pass
+                    // frequently changing values to the shader. see "push
+                    // constants"
+                    using math;
+                    time_since_start := current_time - start_time;
+                    ubo := Uniform_Buffer_Object {
+                        model = mat4_rotate(Vec3{0, 0, 1}, to_radians(90) * f32(time_since_start)),
+                        view = look_at(Vec3{2, 2, 2}, Vec3{0, 0, 0}, Vec3{0, 0, 1}),
+                        proj = perspective(45, f32(swapchain_extent.width) / f32(swapchain_extent.height), 0.1, 10.0),
+                    };
+
+                    ubo.proj[1][1] *= -1;
+
+                    {
+                        data: rawptr;
+                        vk.map_memory(device, uniform_buffers_memory[image_index], 0, size_of(ubo), 0, &data);
+                        assert(data != nil);
+                        defer vk.unmap_memory(device, uniform_buffers_memory[image_index]);
+
+                        mem.copy(data, &ubo, size_of(ubo));
+                    }
+                }
 
                 submit_info := vk.Submit_Info {
                     s_type = vk.Structure_Type.Submit_Info,
@@ -1254,6 +1384,20 @@ run :: proc() -> int {
     vk.wait_for_fences(device, cast(u32)len(in_flight_fences), &in_flight_fences[0], true, bits.U64_MAX);
 
     cleanup_swapchain();
+
+    vk.destroy_descriptor_set_layout(device, descriptor_set_layout, nil);
+
+    vk.destroy_descriptor_pool(device, descriptor_pool, nil);
+
+    assert(len(swapchain_images) == len(uniform_buffers));
+    assert(len(uniform_buffers) == len(uniform_buffers_memory));
+
+    for _, i in swapchain_images {
+        vk.destroy_buffer(device, uniform_buffers[i], nil);
+        vk.free_memory(device, uniform_buffers_memory[i], nil);
+    }
+    delete(uniform_buffers);
+    delete(uniform_buffers_memory);
 
     vk.destroy_buffer(device, vertex_buffer, nil);
     vk.free_memory(device, vertex_buffer_memory, nil);

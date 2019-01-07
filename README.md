@@ -53,3 +53,7 @@ A fullscreen raymarched sphere with displacement.
 ## [vulkan_triangle](vulkan_triangle/vulkan_triangle.odin)
 
 ![A red, blue, and green triangle rendered with Vulkan](docs/screenshots/vulkan_triangle.png)
+
+## [vulkan_buffers](vulkan_buffers/vulkan_buffers.odin)
+
+![A rotating square rendered with Vulkan](docs/screenshots/vulkan_buffers.png)
