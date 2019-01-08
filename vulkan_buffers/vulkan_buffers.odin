@@ -3,6 +3,8 @@ package vulkan_buffers
 // Thanks to the Vulkan Tutorial "Drawing a triangle" at
 // https://vulkan-tutorial.com/Drawing_a_triangle/
 
+// TODO: @Perf investigate "dedicated allocation extension" for framebuffers
+
 import "core:fmt"
 import "core:math"
 import "core:mem"
@@ -43,7 +45,7 @@ HEIGHT :: 720;
 
 Vertex :: struct #packed {
     // an example of "interleaving vertex attributes"
-    pos: math.Vec2,
+    pos: math.Vec3,
     color: math.Vec3,
     tex_coord: math.Vec2,
 }
@@ -57,13 +59,21 @@ Vertex_binding_description :: proc() -> vk.Vertex_Input_Binding_Description {
 }
 
 vertices := []Vertex {
-    {{-0.5, -0.5}, {1.0, 0.0, 0.0}, {1, 0}},
-    {{0.5, -0.5}, {0.0, 1.0, 0.0}, {0, 0}},
-    {{0.5, 0.5}, {0.0, 0.0, 1.0}, {0, 1}},
-    {{-0.5, 0.5}, {1.0, 1.0, 1.0}, {1, 1}}
+    {{-0.5, -0.5, 0}, {1.0, 0.0, 0.0}, {1, 0}},
+    {{0.5, -0.5, 0}, {0.0, 1.0, 0.0}, {0, 0}},
+    {{0.5, 0.5, 0}, {0.0, 0.0, 1.0}, {0, 1}},
+    {{-0.5, 0.5, 0}, {1.0, 1.0, 1.0}, {1, 1}},
+
+    {{-0.5, -0.5, -0.5}, {1.0, 0.0, 0.0}, {1, 0}},
+    {{0.5, -0.5, -0.5}, {0.0, 1.0, 0.0}, {0, 0}},
+    {{0.5, 0.5, -0.5}, {0.0, 0.0, 1.0}, {0, 1}},
+    {{-0.5, 0.5, -0.5}, {1.0, 1.0, 1.0}, {1, 1}},
 };
 
-indices := []u16 { 0, 1, 2, 2, 3, 0 };
+indices := []u16 {
+    0, 1, 2, 2, 3, 0,
+    4, 5, 6, 6, 7, 4,
+};
 
 Uniform_Buffer_Object :: struct #packed {
     model, view, proj: math.Mat4,
@@ -238,6 +248,10 @@ swapchain_image_format: vk.Format;
 swapchain_extent: vk.Extent2D;
 graphics_pipeline : vk.Pipeline;
 
+depth_image: vk.Image;
+depth_image_memory: vk.Device_Memory;
+depth_image_view: vk.Image_View;
+
 pipeline_layout : vk.Pipeline_Layout;
 framebuffer_resized := false;
 vertex_buffer: vk.Buffer;
@@ -257,6 +271,10 @@ texture_image_view: vk.Image_View;
 texture_sampler: vk.Sampler;
 
 cleanup_swapchain :: proc() {
+    vk.destroy_image_view(device, depth_image_view, nil);
+    vk.destroy_image(device, depth_image, nil);
+    vk.free_memory(device, depth_image_memory, nil);
+
     for framebuffer in swapchain_framebuffers {
         vk.destroy_framebuffer(device, framebuffer, nil);
     }
@@ -355,7 +373,7 @@ recreate_swapchain :: proc(window: glfw.Window_Handle, first_run:bool = false) {
         {
             swapchain_imageviews = make([]vk.Image_View, len(swapchain_images));
             for _, i in swapchain_images {
-                swapchain_imageviews[i] = vk_util.create_image_view(device, swapchain_images[i], swapchain_image_format);
+                swapchain_imageviews[i] = vk_util.create_image_view(device, swapchain_images[i], swapchain_image_format, {vk.Image_Aspect_Flag.Color});
                 /* TODO: If you were working on a stereographic 3D
                 * application, then you would create a swap chain with
                 * multiple layers. You could then create multiple image
@@ -396,20 +414,38 @@ recreate_swapchain :: proc(window: glfw.Window_Handle, first_run:bool = false) {
             layout = vk.Image_Layout.Color_Attachment_Optimal,
         };
 
+        depth_attachment := vk.Attachment_Description {
+            format = vk_util.find_depth_format(physical_device),
+            samples = {vk.Sample_Count_Flag._1},
+            load_op = vk.Attachment_Load_Op.Clear,
+            store_op = vk.Attachment_Store_Op.Dont_Care, // depth won't be read after drawing is finished, may allow additional optimizations
+            stencil_load_op = vk.Attachment_Load_Op.Dont_Care,
+            stencil_store_op = vk.Attachment_Store_Op.Dont_Care,
+            initial_layout = vk.Image_Layout.Undefined,
+            final_layout = vk.Image_Layout.Depth_Stencil_Attachment_Optimal,
+        };
+
+        depth_attachment_ref := vk.Attachment_Reference {
+            attachment = 1,
+            layout = vk.Image_Layout.Depth_Stencil_Attachment_Optimal,
+        };
+
         subpass := vk.Subpass_Description {
             pipeline_bind_point = vk.Pipeline_Bind_Point.Graphics,
             color_attachment_count = 1,
             color_attachments = &color_attachment_ref,
+            depth_stencil_attachment = &depth_attachment_ref,
             //input_attachments
             //resolve_attachments
-            //depth_stencil_attachments
             //preserve_attachments
         };
 
+        attachments := [2]vk.Attachment_Description { color_attachment, depth_attachment };
+
         render_pass_info := vk.Render_Pass_Create_Info {
             s_type = vk.Structure_Type.Render_Pass_Create_Info,
-            attachment_count = 1,
-            attachments = &color_attachment,
+            attachment_count = len(attachments),
+            attachments = &attachments[0],
             subpass_count = 1,
             subpasses = &subpass,
             dependency_count = 1,
@@ -589,7 +625,7 @@ recreate_swapchain :: proc(window: glfw.Window_Handle, first_run:bool = false) {
             {
                 binding = 0,
                 location = 0,
-                format = vk.Format.R32G32_Sfloat,
+                format = vk.Format.R32G32B32_Sfloat,
                 offset = cast(u32)offset_of(Vertex, pos),
             },
             {
@@ -719,6 +755,20 @@ recreate_swapchain :: proc(window: glfw.Window_Handle, first_run:bool = false) {
         check_vk_success(vk.create_pipeline_layout(device, &pipeline_layout_info, nil, &pipeline_layout),
             "Failed to create pipeline layout.");
 
+        depth_stencil := vk.Pipeline_Depth_Stencil_State_Create_Info {
+            s_type = vk.Structure_Type.Pipeline_Depth_Stencil_State_Create_Info,
+            depth_test_enable = true,
+            depth_write_enable = true,
+            depth_compare_op = vk.Compare_Op.Less, // lower depth = closer, so depth of new fragments should be LESS
+            depth_bounds_test_enable = false,
+            min_depth_bounds = 0, // optional
+            max_depth_bounds = 1, // optional
+
+            stencil_test_enable = false,
+            front = {}, //optional
+            back = {}, //optional
+        };
+
         graphics_pipeline_info := vk.Graphics_Pipeline_Create_Info {
             s_type = vk.Structure_Type.Graphics_Pipeline_Create_Info,
             stage_count = 2,
@@ -730,7 +780,7 @@ recreate_swapchain :: proc(window: glfw.Window_Handle, first_run:bool = false) {
             viewport_state = &viewport_state,
             rasterization_state = &rasterizer,
             multisample_state = &multisampling,
-            depth_stencil_state = nil, // optional
+            depth_stencil_state = &depth_stencil,
             color_blend_state = &color_blending,
             dynamic_state = nil, // optional
             layout = pipeline_layout,
@@ -743,16 +793,36 @@ recreate_swapchain :: proc(window: glfw.Window_Handle, first_run:bool = false) {
         check_vk_success(vk.create_graphics_pipelines(device, nil, 1, &graphics_pipeline_info, nil, &graphics_pipeline),
             "Failed to create graphics pipeline.");
     }
+    
+    // create depth resources
+    {
+        depth_format := vk_util.find_depth_format(physical_device);
+        vk_util.create_image(device, physical_device, swapchain_extent.width, swapchain_extent.height,
+            depth_format,
+            vk.Image_Tiling.Optimal,
+            {vk.Image_Usage_Flag.Depth_Stencil_Attachment},
+            {vk.Memory_Property_Flag.Device_Local},
+            &depth_image,
+            &depth_image_memory);
+
+        depth_image_view = vk_util.create_image_view(device, depth_image, depth_format, {vk.Image_Aspect_Flag.Depth});
+        transition_image_layout(depth_image, depth_format, vk.Image_Layout.Undefined, vk.Image_Layout.Depth_Stencil_Attachment_Optimal);
+    }
 
     // create framebuffers
     {
         swapchain_framebuffers = make([]vk.Framebuffer, len(swapchain_imageviews));
         for i := 0; i < len(swapchain_imageviews); i += 1 {
-            attachments := []vk.Image_View { swapchain_imageviews[i] };
+            // The color attachment differs for every swap chain image, but the
+            // same depth image can be used by all of them because only a
+            // single subpass is running at the same time due to our
+            // semaphores.
+            attachments := [2]vk.Image_View { swapchain_imageviews[i], depth_image_view };
+
             framebuffer_info := vk.Framebuffer_Create_Info {
                 s_type = vk.Structure_Type.Framebuffer_Create_Info,
                 render_pass = render_pass,
-                attachment_count = 1,
+                attachment_count = len(attachments),
                 attachments = &attachments[0],
                 width = swapchain_extent.width,
                 height = swapchain_extent.height,
@@ -789,9 +859,12 @@ recreate_swapchain :: proc(window: glfw.Window_Handle, first_run:bool = false) {
             check_vk_success(vk.begin_command_buffer(command_buffers[i], &begin_info),
                 "Failed to begin recording command buffer");
 
-            clear_value : vk.Clear_Value;
-            clear_value.color.float32 = {0, 0, 0, 1};
-            clear_value.depth_stencil = {depth=0, stencil=0};
+            // TODO: when odin's raw_union support is fixed, just use vk.Clear_Value here.
+            // see https://gist.github.com/kevinw/122fb7d711ecfde75661e5d7b67d523e
+            Clear_Value_Fix :: struct { r, g, b, a: f32 } // for depth buffers, {r=Depth, g=Stencil}
+            clear_values : [2]Clear_Value_Fix; // len has to match number of framebuffer attachments
+            clear_values[0] = {0, 0, 0, 1};
+            clear_values[1] = {1, 0, 0, 0};
 
             render_pass_info := vk.Render_Pass_Begin_Info {
                 s_type = vk.Structure_Type.Render_Pass_Begin_Info,
@@ -801,8 +874,8 @@ recreate_swapchain :: proc(window: glfw.Window_Handle, first_run:bool = false) {
                     offset = {0, 0}, // @Perf: should match attachment sizes for best performance
                     extent = swapchain_extent,
                 },
-                clear_value_count = 1,
-                clear_values = &clear_value,
+                clear_value_count = u32(len(clear_values)),
+                clear_values = cast(^vk.Clear_Value)(&clear_values[0]),
             };
 
             // Draw the triangle
@@ -811,26 +884,14 @@ recreate_swapchain :: proc(window: glfw.Window_Handle, first_run:bool = false) {
 
             {
                 vertex_buffers := [1]vk.Buffer { vertex_buffer };
-                offsets := [1]vk.Device_Size { 0 };
+                offsets := [1]vk.Device_Size {0};
                 vk.cmd_bind_vertex_buffers(command_buffers[i], 0, 1, &vertex_buffers[0], &offsets[0]);
                 vk.cmd_bind_index_buffer(command_buffers[i], index_buffer, 0, vk.Index_Type.Uint16);
             }
 
-            /*
-            vk.cmd_draw(
-                command_buffer=command_buffers[i],
-                vertex_count=u32(len(vertices)),
-                instance_count=1,
-                first_vertex=0,
-                first_instance=0);
-            */
-
             vk.cmd_bind_descriptor_sets(command_buffers[i], vk.Pipeline_Bind_Point.Graphics, pipeline_layout, 0, 1, &descriptor_sets[i], 0, nil);
-
             vk.cmd_draw_indexed(command_buffers[i], u32(len(indices)), 1, 0, 0, 0);
-
             vk.cmd_end_render_pass(command_buffers[i]);
-
             check_vk_success(vk.end_command_buffer(command_buffers[i]), "Failed to record command buffer.");
         }
     }
@@ -916,6 +977,35 @@ copy_buffer_and_wait :: proc(src_buffer: vk.Buffer, dst_buffer: vk.Buffer, size:
     vk.cmd_copy_buffer(command_buffer, src_buffer, dst_buffer, 1, &copy_region);
 }
 
+/*
+	GLM_FUNC_QUALIFIER mat<4, 4, T, defaultp> perspectiveRH_ZO(T fovy, T aspect, T zNear, T zFar)
+	{
+		assert(abs(aspect - std::numeric_limits<T>::epsilon()) > static_cast<T>(0));
+
+		T const tanHalfFovy = tan(fovy / static_cast<T>(2));
+
+		mat<4, 4, T, defaultp> Result(static_cast<T>(0));
+		Result[0][0] = static_cast<T>(1) / (aspect * tanHalfFovy);
+		Result[1][1] = static_cast<T>(1) / (tanHalfFovy);
+		Result[2][2] = zFar / (zNear - zFar);
+		Result[2][3] = - static_cast<T>(1);
+		Result[3][2] = -(zFar * zNear) / (zFar - zNear);
+		return Result;
+	}
+*/
+
+perspective_vulkan :: proc(fovy, aspect, near, far: f32) -> math.Mat4 {
+	m: math.Mat4;
+	tan_half_fovy := math.tan(0.5 * fovy);
+
+	m[0][0] = 1.0 / (aspect*tan_half_fovy);
+	m[1][1] = 1.0 / (tan_half_fovy);
+	m[2][2] = far / (near - far);
+	m[2][3] = -1.0;
+	m[3][2] = -(far * near) / (far - near);
+	return m;
+}
+
 transition_image_layout :: proc(image: vk.Image, format: vk.Format, old_layout: vk.Image_Layout, new_layout: vk.Image_Layout) {
     command_buffer := begin_single_time_commands();
     defer end_single_time_commands_and_wait(command_buffer);
@@ -928,13 +1018,22 @@ transition_image_layout :: proc(image: vk.Image, format: vk.Format, old_layout: 
         dst_queue_family_index = vk.QUEUE_FAMILY_IGNORED,
         image = image,
         subresource_range = {
-            aspect_mask = {vk.Image_Aspect_Flag.Color},
+            //aspect_mask = {vk.Image_Aspect_Flag.Color},
             base_mip_level = 0,
             level_count = 1,
             base_array_layer = 0,
             layer_count = 1,
         },
     };
+
+    if new_layout == vk.Image_Layout.Depth_Stencil_Attachment_Optimal {
+        barrier.subresource_range.aspect_mask = {vk.Image_Aspect_Flag.Depth};
+        if vk_util.has_stencil_component(format) {
+            barrier.subresource_range.aspect_mask |= {vk.Image_Aspect_Flag.Stencil};
+        }
+    } else {
+        barrier.subresource_range.aspect_mask = {vk.Image_Aspect_Flag.Color};
+    }
 
     source_stage, destination_stage: vk.Pipeline_Stage_Flags;
 
@@ -950,6 +1049,12 @@ transition_image_layout :: proc(image: vk.Image, format: vk.Format, old_layout: 
 
         source_stage = {vk.Pipeline_Stage_Flag.Transfer};
         destination_stage = {vk.Pipeline_Stage_Flag.Fragment_Shader};
+    } else if old_layout == vk.Image_Layout.Undefined && new_layout == vk.Image_Layout.Depth_Stencil_Attachment_Optimal {
+        barrier.src_access_mask = {};
+        barrier.dst_access_mask = {vk.Access_Flag.Depth_Stencil_Attachment_Read, vk.Access_Flag.Depth_Stencil_Attachment_Write};
+
+        source_stage = {vk.Pipeline_Stage_Flag.Top_Of_Pipe}; // earliest possible stage
+        destination_stage = {vk.Pipeline_Stage_Flag.Early_Fragment_Tests};
     } else {
         err_exit("Unsupported layout transition.");
     }
@@ -1363,7 +1468,6 @@ run :: proc() -> int {
         defer stbi.image_free(image_data);
 
         BYTES_PER_PIXEL :: 4;
-        fmt.println("loaded image from", image_path, "with size", image_width, image_height, "and channels in file", image_channels_in_file);
 
         staging_buffer: vk.Buffer = ---;
         staging_buffer_memory: vk.Device_Memory = ---;
@@ -1381,7 +1485,6 @@ run :: proc() -> int {
             check_vk_success(vk.map_memory(device, staging_buffer_memory, 0, image_size, 0, &data),
                 "Failed to map memory for texture.");
             assert(data != nil);
-            fmt.println("copying", int(image_size), "bytes into", data);
             mem.copy(data, image_data, int(image_size));
             vk.unmap_memory(device, staging_buffer_memory);
         }
@@ -1401,7 +1504,7 @@ run :: proc() -> int {
 
     // create texture image view
     {
-        texture_image_view = vk_util.create_image_view(device, texture_image, texture_format);
+        texture_image_view = vk_util.create_image_view(device, texture_image, texture_format, {vk.Image_Aspect_Flag.Color});
     }
 
     // create texture sampler
@@ -1515,7 +1618,7 @@ run :: proc() -> int {
                     ubo := Uniform_Buffer_Object {
                         model = mat4_rotate(Vec3{0, 0, 1}, to_radians(90) * f32(time_since_start)),
                         view = look_at(Vec3{2, 2, 2}, Vec3{0, 0, 0}, Vec3{0, 0, 1}),
-                        proj = perspective(45, f32(swapchain_extent.width) / f32(swapchain_extent.height), 0.1, 10.0),
+                        proj = perspective_vulkan(45, f32(swapchain_extent.width) / f32(swapchain_extent.height), 0.1, 10.0),
                     };
 
                     ubo.proj[1][1] *= -1;

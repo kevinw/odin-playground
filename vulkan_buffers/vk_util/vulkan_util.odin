@@ -51,10 +51,10 @@ create_image :: proc(
         extent = { width = width, height = height, depth = 1, },
         mip_levels = 1,
         array_layers = 1,
-        format = vk.Format.R8G8B8A8_Unorm,
-        tiling = vk.Image_Tiling.Optimal,
+        format = format,
+        tiling = image_tiling,
         initial_layout = vk.Image_Layout.Undefined,
-        usage = {vk.Image_Usage_Flag.Transfer_Dst, vk.Image_Usage_Flag.Sampled},
+        usage = usage,
         sharing_mode = vk.Sharing_Mode.Exclusive,
         samples = {vk.Sample_Count_Flag._1},
         flags = {}, // sparse voxel terrains, etc
@@ -70,7 +70,7 @@ create_image :: proc(
         s_type = vk.Structure_Type.Memory_Allocate_Info,
         allocation_size = mem_requirements.size,
         memory_type_index = find_memory_type(
-            physical_device, mem_requirements.memory_type_bits, {vk.Memory_Property_Flag.Device_Local}),
+            physical_device, mem_requirements.memory_type_bits, properties),
     };
 
     check_vk_success(vk.allocate_memory(device, &alloc_info, nil, image_memory),
@@ -79,14 +79,20 @@ create_image :: proc(
     vk.bind_image_memory(device, image^, image_memory^, 0);
 }
 
-create_image_view :: proc(device: vk.Device, image: vk.Image, format: vk.Format) -> vk.Image_View {
+create_image_view :: proc(
+    device: vk.Device,
+    image: vk.Image,
+    format: vk.Format,
+    aspect_flags: vk.Image_Aspect_Flags,
+) -> vk.Image_View
+{
     view_info := vk.Image_View_Create_Info {
         s_type = vk.Structure_Type.Image_View_Create_Info,
         image = image,
         view_type = vk.Image_View_Type.D2,
         format = format,
         subresource_range = {
-            aspect_mask = {vk.Image_Aspect_Flag.Color},
+            aspect_mask = aspect_flags,
             base_mip_level = 0,
             level_count = 1,
             base_array_layer = 0,
@@ -100,3 +106,34 @@ create_image_view :: proc(device: vk.Device, image: vk.Image, format: vk.Format)
     return image_view;
 
 }
+
+find_supported_format :: proc(
+    physical_device: vk.Physical_Device,
+    candidates: []vk.Format,
+    tiling: vk.Image_Tiling,
+    features: vk.Format_Feature_Flags) -> vk.Format
+{
+    for format in candidates {
+        props: vk.Format_Properties = ---;
+        vk.get_physical_device_format_properties(physical_device, format, &props);
+
+        if tiling == vk.Image_Tiling.Linear && (features & props.linear_tiling_features) == features do return format;
+        else if tiling == vk.Image_Tiling.Optimal && (features & props.optimal_tiling_features) == features do return format;
+    }
+
+    err_exit("Failed to find supported format.");
+    return vk.Format.Undefined;
+}
+
+find_depth_format :: proc(physical_device: vk.Physical_Device) -> vk.Format {
+    return find_supported_format(physical_device,
+        {vk.Format.D32_Sfloat, vk.Format.D32_Sfloat_S8_Uint, vk.Format.D24_Unorm_S8_Uint},
+        vk.Image_Tiling.Optimal,
+        {vk.Format_Feature_Flag.Depth_Stencil_Attachment},
+    );
+}
+
+has_stencil_component :: proc(format: vk.Format) -> bool {
+    return format == vk.Format.D32_Sfloat_S8_Uint || format == vk.Format.D24_Unorm_S8_Uint;
+}
+
