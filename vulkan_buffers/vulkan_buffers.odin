@@ -10,6 +10,8 @@ import "core:os"
 import "core:bits"
 
 import vk "./vulkan_bindings"
+import "./vk_util"
+import "shared:odin-stb/stbi"
 
 import "shared:odin-glfw"
 import glfw_bindings "shared:odin-glfw/bindings"
@@ -28,7 +30,12 @@ when os.OS == "windows" {
     exit :: proc (ret_code: int = -1) { win32.exit_process(cast(u32)ret_code); }
 }
 
-WINDOW_TITLE := "vulkan_triangle";
+
+check_vk_success :: inline proc (res: vk.Result, message: string) {
+    if res != vk.Result.Success do err_exit(message);
+}
+
+WINDOW_TITLE := "vulkan_buffers";
 VALIDATION_LAYERS_ENABLED :: true;
 MAX_FRAMES_IN_FLIGHT :: 2;
 WIDTH :: 1280;
@@ -128,6 +135,11 @@ is_device_suitable :: proc(device: vk.Physical_Device, surface: vk.Surface_KHR) 
     defer SwapChainSupportDetails_delete(&support_details);
     if len(support_details.formats) == 0 || len(support_details.present_modes) == 0 do return false;
 
+    // make sure we have anisotropy
+    supported_features: vk.Physical_Device_Features = ---;
+    vk.get_physical_device_features(device, &supported_features);
+    if !supported_features.sampler_anisotropy do return false;
+
     return true;
 }
 
@@ -200,28 +212,10 @@ choose_swap_surface_format :: proc(available_formats: []vk.Surface_Format_KHR) -
     return available_formats[0];
 }
 
-find_memory_type :: proc(type_filter: u32, properties: vk.Memory_Property_Flags) -> u32 {
-    mem_properties: vk.Physical_Device_Memory_Properties = ---;
-    vk.get_physical_device_memory_properties(physical_device, &mem_properties);
-    for i := u32(0); i < mem_properties.memory_type_count; i += 1 {
-        if type_filter & (1 << i) != 0 &&
-            (mem_properties.memory_types[i].property_flags & properties) == properties {
-            return i;
-        }
-    }
-
-    err_exit("Failed to find suitable memory type.");
-    return 0;
-}
-
 err_exit :: inline proc(message: string, return_code:int = -1) -> int {
     fmt.println_err("Error:", message);
     exit(return_code);
     return -1;
-}
-
-check_vk_success :: inline proc (res: vk.Result, message: string) {
-    if res != vk.Result.Success do err_exit(message);
 }
 
 // TODO: probably should be a struct
@@ -255,6 +249,11 @@ uniform_buffers_memory: []vk.Device_Memory;
 descriptor_set_layout: vk.Descriptor_Set_Layout;
 descriptor_pool: vk.Descriptor_Pool;
 descriptor_sets: []vk.Descriptor_Set;
+
+texture_image: vk.Image;
+texture_image_memory: vk.Device_Memory;
+texture_image_view: vk.Image_View;
+texture_sampler: vk.Sampler;
 
 cleanup_swapchain :: proc() {
     for framebuffer in swapchain_framebuffers {
@@ -355,34 +354,13 @@ recreate_swapchain :: proc(window: glfw.Window_Handle, first_run:bool = false) {
         {
             swapchain_imageviews = make([]vk.Image_View, len(swapchain_images));
             for _, i in swapchain_images {
-                imageview_create_info := vk.Image_View_Create_Info {
-                    s_type = vk.Structure_Type.Image_View_Create_Info,
-                    image = swapchain_images[i],
-                    view_type = vk.Image_View_Type.D2,
-                    format = swapchain_image_format,
-                };
-                {
-                    using imageview_create_info;
-                    components.r = vk.Component_Swizzle.Identity;
-                    components.g = vk.Component_Swizzle.Identity;
-                    components.b = vk.Component_Swizzle.Identity;
-                    components.a = vk.Component_Swizzle.Identity;
-
-                    subresource_range.aspect_mask = {vk.Image_Aspect_Flag.Color};
-                    subresource_range.base_mip_level = 0;
-                    subresource_range.level_count = 1;
-                    subresource_range.base_array_layer = 0;
-                    subresource_range.layer_count = 1;
-                    /* TODO: If you were working on a stereographic 3D
-                    * application, then you would create a swap chain with
-                    * multiple layers. You could then create multiple image
-                    * views for each image representing the views for the left
-                    * and right eyes by accessing different layers.
-                    */
-                }
-
-                check_vk_success(vk.create_image_view(device, &imageview_create_info, nil, &swapchain_imageviews[i]),
-                    "Failed to create image view.");
+                swapchain_imageviews[i] = vk_util.create_image_view(device, swapchain_images[i], swapchain_image_format);
+                /* TODO: If you were working on a stereographic 3D
+                * application, then you would create a swap chain with
+                * multiple layers. You could then create multiple image
+                * views for each image representing the views for the left
+                * and right eyes by accessing different layers.
+                */
             }
         }
     }
@@ -839,7 +817,7 @@ create_buffer :: proc(
     alloc_info := vk.Memory_Allocate_Info {
         s_type = vk.Structure_Type.Memory_Allocate_Info,
         allocation_size = mem_requirements.size,
-        memory_type_index = find_memory_type(mem_requirements.memory_type_bits, properties),
+        memory_type_index = vk_util.find_memory_type(physical_device, mem_requirements.memory_type_bits, properties),
     };
 
     check_vk_success(vk.allocate_memory(device, &alloc_info, nil, buffer_memory),
@@ -848,7 +826,7 @@ create_buffer :: proc(
     vk.bind_buffer_memory(device, buffer^, buffer_memory^, 0);
 }
 
-copy_buffer_and_wait :: proc(src_buffer: vk.Buffer, dst_buffer: vk.Buffer, size: vk.Device_Size) {
+begin_single_time_commands :: proc() -> vk.Command_Buffer {
     // TODO: create a separate command pool for short-lived command buffers
     // like this one, and use VK_COMMAND_POOL_CREATE_TRANSIENT_BIT
 
@@ -868,8 +846,11 @@ copy_buffer_and_wait :: proc(src_buffer: vk.Buffer, dst_buffer: vk.Buffer, size:
     };
 
     vk.begin_command_buffer(command_buffer, &begin_info);
-    copy_region := vk.Buffer_Copy { size = size };
-    vk.cmd_copy_buffer(command_buffer, src_buffer, dst_buffer, 1, &copy_region);
+
+    return command_buffer;
+}
+
+end_single_time_commands_and_wait :: proc(command_buffer: vk.Command_Buffer) {
     vk.end_command_buffer(command_buffer);
 
     submit_info := vk.Submit_Info {
@@ -882,6 +863,91 @@ copy_buffer_and_wait :: proc(src_buffer: vk.Buffer, dst_buffer: vk.Buffer, size:
     vk.queue_wait_idle(graphics_queue); // TODO @Perf: remove this wait_idle and have the caller do it (if there are multiple copies)
 
     vk.free_command_buffers(device, command_pool, 1, &command_buffer);
+}
+
+copy_buffer_and_wait :: proc(src_buffer: vk.Buffer, dst_buffer: vk.Buffer, size: vk.Device_Size) {
+    command_buffer := begin_single_time_commands();
+    defer end_single_time_commands_and_wait(command_buffer);
+
+    copy_region := vk.Buffer_Copy { size = size };
+    vk.cmd_copy_buffer(command_buffer, src_buffer, dst_buffer, 1, &copy_region);
+}
+
+transition_image_layout :: proc(image: vk.Image, format: vk.Format, old_layout: vk.Image_Layout, new_layout: vk.Image_Layout) {
+    command_buffer := begin_single_time_commands();
+    defer end_single_time_commands_and_wait(command_buffer);
+
+    barrier := vk.Image_Memory_Barrier {
+        s_type = vk.Structure_Type.Image_Memory_Barrier,
+        old_layout = old_layout,
+        new_layout = new_layout,
+        src_queue_family_index = vk.QUEUE_FAMILY_IGNORED,
+        dst_queue_family_index = vk.QUEUE_FAMILY_IGNORED,
+        image = image,
+        subresource_range = {
+            aspect_mask = {vk.Image_Aspect_Flag.Color},
+            base_mip_level = 0,
+            level_count = 1,
+            base_array_layer = 0,
+            layer_count = 1,
+        },
+    };
+
+    source_stage, destination_stage: vk.Pipeline_Stage_Flags;
+
+    if old_layout == vk.Image_Layout.Undefined && new_layout == vk.Image_Layout.Transfer_Dst_Optimal {
+        barrier.src_access_mask = {};
+        barrier.dst_access_mask = {vk.Access_Flag.Transfer_Write};
+
+        source_stage = {vk.Pipeline_Stage_Flag.Top_Of_Pipe}; // earliest possible stage
+        destination_stage = {vk.Pipeline_Stage_Flag.Transfer};
+    } else if old_layout == vk.Image_Layout.Transfer_Dst_Optimal && new_layout == vk.Image_Layout.Shader_Read_Only_Optimal {
+        barrier.src_access_mask = {vk.Access_Flag.Transfer_Write};
+        barrier.dst_access_mask = {vk.Access_Flag.Shader_Read};
+
+        source_stage = {vk.Pipeline_Stage_Flag.Transfer};
+        destination_stage = {vk.Pipeline_Stage_Flag.Fragment_Shader};
+    } else {
+        err_exit("Unsupported layout transition.");
+    }
+
+    vk.cmd_pipeline_barrier(command_buffer,
+        source_stage, destination_stage,
+        {},
+        0, nil,
+        0, nil,
+        1, &barrier);
+}
+
+copy_buffer_to_image :: proc(buffer: vk.Buffer, image: vk.Image, width, height: u32) {
+    command_buffer := begin_single_time_commands();
+    defer end_single_time_commands_and_wait(command_buffer);
+
+    region := vk.Buffer_Image_Copy {
+        buffer_offset = 0,
+        buffer_row_length = 0,
+        buffer_image_height = 0,
+
+        image_subresource = {
+            aspect_mask = {vk.Image_Aspect_Flag.Color},
+            mip_level = 0,
+            base_array_layer = 0,
+            layer_count = 1
+        },
+
+        image_offset = {0, 0, 0},
+        image_extent = {width, height, 1},
+    };
+
+    // Assumes the image has already been transitioned to the layout that is
+    // optimal for copying pixels to.
+    vk.cmd_copy_buffer_to_image(
+        command_buffer,
+        buffer,
+        image,
+        vk.Image_Layout.Transfer_Dst_Optimal,
+        1,
+        &region);
 }
 
 run :: proc() -> int {
@@ -1114,7 +1180,10 @@ run :: proc() -> int {
         }
 
         // Create the logical device
-        device_features := vk.Physical_Device_Features {};
+        device_features := vk.Physical_Device_Features {
+            sampler_anisotropy = true,
+        };
+
         device_create_info := vk.Device_Create_Info {
             s_type = vk.Structure_Type.Device_Create_Info,
             queue_create_infos = mem.raw_data(queue_create_infos),
@@ -1185,7 +1254,8 @@ run :: proc() -> int {
 
         {
             data: rawptr = ---;
-            vk.map_memory(device, staging_buffer_memory, 0, size, 0, &data);
+            check_vk_success(vk.map_memory(device, staging_buffer_memory, 0, size, 0, &data),
+                "Failed to map memory for vertices.");
             defer vk.unmap_memory(device, staging_buffer_memory);
 
             mem.copy(data, &vertices[0], cast(int)size);
@@ -1220,7 +1290,8 @@ run :: proc() -> int {
 
         {
             data: rawptr = ---;
-            vk.map_memory(device, staging_buffer_memory, 0, size, 0, &data);
+            check_vk_success(vk.map_memory(device, staging_buffer_memory, 0, size, 0, &data),
+                "Failed to map memory for indices.");
             defer vk.unmap_memory(device, staging_buffer_memory);
 
             mem.copy(data, &indices[0], cast(int)size);
@@ -1235,6 +1306,88 @@ run :: proc() -> int {
 
         copy_buffer_and_wait(staging_buffer, index_buffer, size);
     }
+
+    // create texture image
+    texture_format :: vk.Format.R8G8B8A8_Unorm;
+    {
+        image_width, image_height, image_channels_in_file : i32;
+        image_path := cstring("vulkan_buffers/textures/texture.jpg");
+
+        REQUESTED_CHANNELS :: 4;
+
+        image_data := stbi.load(cast(^u8)image_path, &image_width, &image_height, &image_channels_in_file, REQUESTED_CHANNELS);
+        if image_data == nil || image_width < 1 || image_height < 1 do err_exit("Could not load texture");
+        defer stbi.image_free(image_data);
+
+        BYTES_PER_PIXEL :: 4;
+        fmt.println("loaded image from", image_path, "with size", image_width, image_height, "and channels in file", image_channels_in_file);
+
+        staging_buffer: vk.Buffer = ---;
+        staging_buffer_memory: vk.Device_Memory = ---;
+
+        image_size := vk.Device_Size(image_width * image_height * BYTES_PER_PIXEL);
+        create_buffer(image_size, {vk.Buffer_Usage_Flag.Transfer_Src},
+            {vk.Memory_Property_Flag.Host_Visible, vk.Memory_Property_Flag.Host_Coherent},
+            &staging_buffer, &staging_buffer_memory);
+
+        defer vk.destroy_buffer(device, staging_buffer, nil);
+        defer vk.free_memory(device, staging_buffer_memory, nil);
+
+        {
+            data: rawptr;
+            check_vk_success(vk.map_memory(device, staging_buffer_memory, 0, image_size, 0, &data),
+                "Failed to map memory for texture.");
+            assert(data != nil);
+            fmt.println("copying", int(image_size), "bytes into", data);
+            mem.copy(data, image_data, int(image_size));
+            vk.unmap_memory(device, staging_buffer_memory);
+        }
+
+        vk_util.create_image(device, physical_device, u32(image_width), u32(image_height),
+            texture_format,
+            vk.Image_Tiling.Optimal,
+            {vk.Image_Usage_Flag.Transfer_Dst, vk.Image_Usage_Flag.Sampled},
+            {vk.Memory_Property_Flag.Device_Local},
+            &texture_image,
+            &texture_image_memory);
+
+        transition_image_layout(texture_image, texture_format, vk.Image_Layout.Undefined, vk.Image_Layout.Transfer_Dst_Optimal);
+        copy_buffer_to_image(staging_buffer, texture_image, u32(image_width), u32(image_height));
+        transition_image_layout(texture_image, texture_format, vk.Image_Layout.Transfer_Dst_Optimal, vk.Image_Layout.Shader_Read_Only_Optimal);
+    }
+
+    // create texture image view
+    {
+        texture_image_view = vk_util.create_image_view(device, texture_image, texture_format);
+    }
+
+    // create texture sampler
+    {
+        sampler_info := vk.Sampler_Create_Info {
+            s_type = vk.Structure_Type.Sampler_Create_Info,
+            mag_filter = vk.Filter.Linear,
+            min_filter = vk.Filter.Linear,
+            address_mode_u = vk.Sampler_Address_Mode.Repeat,
+            address_mode_v = vk.Sampler_Address_Mode.Repeat,
+            address_mode_w = vk.Sampler_Address_Mode.Repeat,
+            anisotropy_enable = true,
+            max_anisotropy = 16, // TODO: @Perf don't always use anisotropy if it's not necessary
+            border_color = vk.Border_Color.Int_Opaque_Black,
+            unnormalized_coordinates = false,
+
+            compare_enable = false, // used for percentage-closer filtering on shadowmaps
+            compare_op = vk.Compare_Op.Always,
+
+            mipmap_mode = vk.Sampler_Mipmap_Mode.Linear,
+            mip_lod_bias = 0,
+            min_lod = 0,
+            max_lod = 0,
+        };
+
+        check_vk_success(vk.create_sampler(device, &sampler_info, nil, &texture_sampler),
+            "Failed to create texture sampler.");
+    }
+
 
     recreate_swapchain(window, true);
 
@@ -1326,7 +1479,8 @@ run :: proc() -> int {
 
                     {
                         data: rawptr;
-                        vk.map_memory(device, uniform_buffers_memory[image_index], 0, size_of(ubo), 0, &data);
+                        check_vk_success(vk.map_memory(device, uniform_buffers_memory[image_index], 0, size_of(ubo), 0, &data),
+                            "Failed to map memory for uniforms.");
                         assert(data != nil);
                         defer vk.unmap_memory(device, uniform_buffers_memory[image_index]);
 
@@ -1384,6 +1538,11 @@ run :: proc() -> int {
     vk.wait_for_fences(device, cast(u32)len(in_flight_fences), &in_flight_fences[0], true, bits.U64_MAX);
 
     cleanup_swapchain();
+
+    vk.destroy_sampler(device, texture_sampler, nil);
+    vk.destroy_image_view(device, texture_image_view, nil);
+    vk.destroy_image(device, texture_image, nil);
+    vk.free_memory(device, texture_image_memory, nil);
 
     vk.destroy_descriptor_set_layout(device, descriptor_set_layout, nil);
 
