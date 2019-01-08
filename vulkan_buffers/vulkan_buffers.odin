@@ -45,6 +45,7 @@ Vertex :: struct #packed {
     // an example of "interleaving vertex attributes"
     pos: math.Vec2,
     color: math.Vec3,
+    tex_coord: math.Vec2,
 }
 
 Vertex_binding_description :: proc() -> vk.Vertex_Input_Binding_Description {
@@ -56,10 +57,10 @@ Vertex_binding_description :: proc() -> vk.Vertex_Input_Binding_Description {
 }
 
 vertices := []Vertex {
-    {{-0.5, -0.5}, {1.0, 0.0, 0.0}},
-    {{0.5, -0.5}, {0.0, 1.0, 0.0}},
-    {{0.5, 0.5}, {0.0, 0.0, 1.0}},
-    {{-0.5, 0.5}, {1.0, 1.0, 1.0}}
+    {{-0.5, -0.5}, {1.0, 0.0, 0.0}, {1, 0}},
+    {{0.5, -0.5}, {0.0, 1.0, 0.0}, {0, 0}},
+    {{0.5, 0.5}, {0.0, 0.0, 1.0}, {0, 1}},
+    {{-0.5, 0.5}, {1.0, 1.0, 1.0}, {1, 1}}
 };
 
 indices := []u16 { 0, 1, 2, 2, 3, 0 };
@@ -434,8 +435,8 @@ recreate_swapchain :: proc(window: glfw.Window_Handle, first_run:bool = false) {
         }
     }
 
-    // create descriptor set layout
     if (first_run) {
+        // create descriptor set layout
         ubo_layout_binding := vk.Descriptor_Set_Layout_Binding {
             binding = 0,
             descriptor_type = vk.Descriptor_Type.Uniform_Buffer,
@@ -443,10 +444,23 @@ recreate_swapchain :: proc(window: glfw.Window_Handle, first_run:bool = false) {
             stage_flags = {vk.Shader_Stage_Flag.Vertex},
         };
 
+        
+        // create sampler descriptor set layout
+        sampler_layout_binding := vk.Descriptor_Set_Layout_Binding {
+            binding = 1,
+            descriptor_count = 1,
+            descriptor_type = vk.Descriptor_Type.Combined_Image_Sampler,
+            immutable_samplers = nil,
+            stage_flags = {vk.Shader_Stage_Flag.Fragment},
+        };
+
+        bindings : []vk.Descriptor_Set_Layout_Binding = {ubo_layout_binding, sampler_layout_binding};
+        assert(len(bindings) == 2);
+
         layout_info := vk.Descriptor_Set_Layout_Create_Info {
             s_type = vk.Structure_Type.Descriptor_Set_Layout_Create_Info,
-            binding_count = 1,
-            bindings = &ubo_layout_binding,
+            binding_count = u32(len(bindings)),
+            bindings = &bindings[0],
         };
 
         check_vk_success(vk.create_descriptor_set_layout(device, &layout_info, nil, &descriptor_set_layout),
@@ -457,15 +471,19 @@ recreate_swapchain :: proc(window: glfw.Window_Handle, first_run:bool = false) {
     if (first_run) {
         num_swapchain_images := u32(len(swapchain_images));
 
-        pool_size := vk.Descriptor_Pool_Size {
-            type = vk.Descriptor_Type.Uniform_Buffer,
-            descriptor_count = num_swapchain_images,
-        };
+        pool_sizes : [2]vk.Descriptor_Pool_Size;
+        assert(len(pool_sizes) == 2);
+
+        pool_sizes[0].type = vk.Descriptor_Type.Uniform_Buffer;
+        pool_sizes[0].descriptor_count = num_swapchain_images;
+
+        pool_sizes[1].type = vk.Descriptor_Type.Combined_Image_Sampler;
+        pool_sizes[1].descriptor_count = num_swapchain_images;
 
         pool_info := vk.Descriptor_Pool_Create_Info {
             s_type = vk.Structure_Type.Descriptor_Pool_Create_Info,
-            pool_size_count = 1,
-            pool_sizes = &pool_size,
+            pool_size_count = len(pool_sizes),
+            pool_sizes = &pool_sizes[0],
             max_sets = num_swapchain_images,
         };
         check_vk_success(vk.create_descriptor_pool(device, &pool_info, nil, &descriptor_pool),
@@ -495,7 +513,15 @@ recreate_swapchain :: proc(window: glfw.Window_Handle, first_run:bool = false) {
                 range = size_of(Uniform_Buffer_Object),
             };
 
-            descriptor_write := vk.Write_Descriptor_Set {
+            image_info := vk.Descriptor_Image_Info {
+                image_layout = vk.Image_Layout.Shader_Read_Only_Optimal,
+                image_view = texture_image_view,
+                sampler = texture_sampler,
+            };
+
+            descriptor_writes : [2]vk.Write_Descriptor_Set;
+
+            descriptor_writes[0] = vk.Write_Descriptor_Set {
                 s_type = vk.Structure_Type.Write_Descriptor_Set,
                 dst_set = descriptor_sets[i],
                 dst_binding = 0,
@@ -507,7 +533,17 @@ recreate_swapchain :: proc(window: glfw.Window_Handle, first_run:bool = false) {
                 texel_buffer_view = nil,
             };
 
-            vk.update_descriptor_sets(device, 1, &descriptor_write, 0, nil);
+            descriptor_writes[1] = vk.Write_Descriptor_Set {
+                s_type = vk.Structure_Type.Write_Descriptor_Set,
+                dst_set = descriptor_sets[i],
+                dst_binding = 1,
+                dst_array_element = 0,
+                descriptor_type = vk.Descriptor_Type.Combined_Image_Sampler,
+                descriptor_count = 1,
+                image_info = &image_info
+            };
+
+            vk.update_descriptor_sets(device, u32(len(descriptor_writes)), &descriptor_writes[0], 0, nil);
         }
     }
 
@@ -548,7 +584,8 @@ recreate_swapchain :: proc(window: glfw.Window_Handle, first_run:bool = false) {
         shader_stages := []vk.Pipeline_Shader_Stage_Create_Info { vert_shader_stage_info, frag_shader_stage_info, };
 
         binding_description := Vertex_binding_description();
-        attribute_descriptions := [2]vk.Vertex_Input_Attribute_Description {
+
+        attribute_descriptions := [3]vk.Vertex_Input_Attribute_Description {
             {
                 binding = 0,
                 location = 0,
@@ -561,13 +598,19 @@ recreate_swapchain :: proc(window: glfw.Window_Handle, first_run:bool = false) {
                 format = vk.Format.R32G32B32_Sfloat,
                 offset = cast(u32)offset_of(Vertex, color),
             },
+            {
+                binding = 0,
+                location = 2,
+                format = vk.Format.R32G32_Sfloat,
+                offset = cast(u32)offset_of(Vertex, tex_coord),
+            },
         };
 
         vertex_input_info := vk.Pipeline_Vertex_Input_State_Create_Info {
             s_type = vk.Structure_Type.Pipeline_Vertex_Input_State_Create_Info,
             vertex_binding_description_count = 1,
             vertex_binding_descriptions = &binding_description,
-            vertex_attribute_description_count = 2,
+            vertex_attribute_description_count = len(attribute_descriptions),
             vertex_attribute_descriptions = &attribute_descriptions[0],
         };
 
