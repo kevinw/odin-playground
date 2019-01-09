@@ -1,5 +1,6 @@
 main.exe
 main.pdb
+main.obj
 msvc/
 *.bc
 *.ll
