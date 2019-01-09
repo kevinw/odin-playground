@@ -10,6 +10,8 @@ import "core:math"
 import "core:mem"
 import "core:os"
 import "core:bits"
+import "core:math/rand"
+
 
 import vk "./vulkan_bindings"
 import "./vk_util"
@@ -17,6 +19,7 @@ import "shared:odin-stb/stbi"
 
 import "shared:odin-glfw"
 import glfw_bindings "shared:odin-glfw/bindings"
+import tinyobj "../tinyobjloader_c"
 
 import "../path"
 
@@ -42,6 +45,8 @@ VALIDATION_LAYERS_ENABLED :: true;
 MAX_FRAMES_IN_FLIGHT :: 2;
 WIDTH :: 1280;
 HEIGHT :: 720;
+MODEL_PATH :: "vulkan_buffers/models/chalet.obj";
+TEXTURE_PATH :: "vulkan_buffers/textures/chalet.jpg";
 
 Vertex :: struct #packed {
     // an example of "interleaving vertex attributes"
@@ -57,23 +62,6 @@ Vertex_binding_description :: proc() -> vk.Vertex_Input_Binding_Description {
         input_rate = vk.Vertex_Input_Rate.Vertex,
     };
 }
-
-vertices := []Vertex {
-    {{-0.5, -0.5, 0}, {1.0, 0.0, 0.0}, {1, 0}},
-    {{0.5, -0.5, 0}, {0.0, 1.0, 0.0}, {0, 0}},
-    {{0.5, 0.5, 0}, {0.0, 0.0, 1.0}, {0, 1}},
-    {{-0.5, 0.5, 0}, {1.0, 1.0, 1.0}, {1, 1}},
-
-    {{-0.5, -0.5, -0.5}, {1.0, 0.0, 0.0}, {1, 0}},
-    {{0.5, -0.5, -0.5}, {0.0, 1.0, 0.0}, {0, 0}},
-    {{0.5, 0.5, -0.5}, {0.0, 0.0, 1.0}, {0, 1}},
-    {{-0.5, 0.5, -0.5}, {1.0, 1.0, 1.0}, {1, 1}},
-};
-
-indices := []u16 {
-    0, 1, 2, 2, 3, 0,
-    4, 5, 6, 6, 7, 4,
-};
 
 Uniform_Buffer_Object :: struct #packed {
     model, view, proj: math.Mat4,
@@ -269,6 +257,10 @@ texture_image: vk.Image;
 texture_image_memory: vk.Device_Memory;
 texture_image_view: vk.Image_View;
 texture_sampler: vk.Sampler;
+
+vertices : []Vertex;
+indices : []u32;
+
 
 cleanup_swapchain :: proc() {
     vk.destroy_image_view(device, depth_image_view, nil);
@@ -886,7 +878,7 @@ recreate_swapchain :: proc(window: glfw.Window_Handle, first_run:bool = false) {
                 vertex_buffers := [1]vk.Buffer { vertex_buffer };
                 offsets := [1]vk.Device_Size {0};
                 vk.cmd_bind_vertex_buffers(command_buffers[i], 0, 1, &vertex_buffers[0], &offsets[0]);
-                vk.cmd_bind_index_buffer(command_buffers[i], index_buffer, 0, vk.Index_Type.Uint16);
+                vk.cmd_bind_index_buffer(command_buffers[i], index_buffer, 0, vk.Index_Type.Uint32); // TODO: make a compile-time func to select Uint32 or Uint16
             }
 
             vk.cmd_bind_descriptor_sets(command_buffers[i], vk.Pipeline_Bind_Point.Graphics, pipeline_layout, 0, 1, &descriptor_sets[i], 0, nil);
@@ -1373,6 +1365,65 @@ run :: proc() -> int {
     }
     defer vk.destroy_command_pool(device, command_pool, nil);
 
+    // load model
+    {
+        model_data, ok := os.read_entire_file(MODEL_PATH);
+        if !ok do err_exit("Could not load model data.");
+
+        //fmt.println("model data", len(model_data));
+
+        using tinyobj;
+
+        attrib: Attrib;
+        shapes: []Shape;
+        materials: []Material;
+
+        flags := FLAG_TRIANGULATE;
+
+        result := parse(&attrib, &shapes, &materials, model_data, flags); 
+        if result != SUCCESS {
+            fmt.println("tinyobj error: %v", result);
+            err_exit("Error parsing OBJ file.");
+        }
+
+        //fmt.println("parsed model with", len(attrib.vertices), "vertices");
+
+        // assume triangles
+        assert(len(attrib.faces) % 3 == 0); // assume triangulation
+        assert(len(shapes) == 1); // TODO: handle multiple shapes
+
+        actual_num_verts := len(attrib.vertices) / 3;
+        actual_num_indices := len(attrib.faces) / 3;
+
+        vertices = make([]Vertex, actual_num_verts);
+        indices = make([]u32, actual_num_indices);
+
+        rnd_state := rand.Rand {};
+        rand.init(&rnd_state, 424242);
+
+        for i := 0; i < len(vertices); i += 1 {
+            vertices[i] = Vertex{
+                pos = {
+                    attrib.vertices[i * 3 + 0],
+                    attrib.vertices[i * 3 + 1],
+                    attrib.vertices[i * 3 + 2]
+                },
+                color = {
+                    rand.float32(&rnd_state),
+                    rand.float32(&rnd_state),
+                    rand.float32(&rnd_state), // col
+                },
+                tex_coord = {
+                    0, 0, // uv
+                },
+            };
+        }
+
+        for i := 0; i < len(indices); i += 1 {
+            indices[i] = cast(u32)attrib.faces[i].v_idx;
+        }
+    }
+
     // create vertex buffer
     /* TODO @Perf
         Driver developers recommend that you also store multiple buffers, like
@@ -1455,11 +1506,14 @@ run :: proc() -> int {
         copy_buffer_and_wait(staging_buffer, index_buffer, size);
     }
 
+    delete(vertices);
+    delete(indices);
+
     // create texture image
     texture_format :: vk.Format.R8G8B8A8_Unorm;
     {
         image_width, image_height, image_channels_in_file : i32;
-        image_path := cstring("vulkan_buffers/textures/texture.jpg");
+        image_path := cstring(TEXTURE_PATH);
 
         REQUESTED_CHANNELS :: 4;
 
