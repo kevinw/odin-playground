@@ -53,6 +53,18 @@ Vertex :: struct #packed {
     tex_coord: math.Vec2,
 }
 
+// java-ish hashing of float[]
+Vertex_hash :: inline proc(a: ^Vertex) -> int {
+    floats := mem.slice_ptr(cast(^f32)a, 8);
+    h := 1;
+    for i := 0; i < len(floats); i += 1 {
+        float_as_int:int = (cast(^int)(&floats[i]))^;
+        h = 31 * h + float_as_int;
+    }
+    h = h ~ ((h >> 20) ~ (h >> 12));
+    return h ~ (h >> 7) ~ (h >> 4);
+}
+
 Vertex_eq :: inline proc(a: ^Vertex, b: ^Vertex) -> bool {
     return a.pos == b.pos && a.color == b.color && a.tex_coord == b.tex_coord;
 }
@@ -260,7 +272,7 @@ texture_image_memory: vk.Device_Memory;
 texture_image_view: vk.Image_View;
 texture_sampler: vk.Sampler;
 
-vertices : []Vertex;
+vertices : [dynamic]Vertex;
 indices : []u32;
 
 
@@ -1372,71 +1384,51 @@ run :: proc() -> int {
         model_data, ok := os.read_entire_file(MODEL_PATH);
         if !ok do err_exit("Could not load model data.");
 
-        //fmt.println("model data", len(model_data));
-
         using tinyobj;
 
         attrib: Attrib;
         shapes: []Shape;
         materials: []Material;
-
         flags := FLAG_TRIANGULATE;
-
         result := parse(&attrib, &shapes, &materials, model_data, flags); 
         if result != SUCCESS {
             fmt.println("tinyobj error: %v", result);
             err_exit("Error parsing OBJ file.");
         }
 
-        // assume triangles
         assert(len(attrib.faces) % 3 == 0); // assume triangulation
         assert(len(shapes) == 1); // TODO: handle multiple shapes
-
         num_faces := len(attrib.faces);
 
-        REUSE_VERTS :: false;
-
-        vertices = make([]Vertex, num_faces);
+        vertices = make([dynamic]Vertex);
         indices = make([]u32, num_faces);
 
-        vertex_index := 0;
+        unique_vertices := make(map[int]u32);
+        defer delete(unique_vertices);
+
+        vertex_index := u32(0);
 
         for indices_index := 0; indices_index < num_faces; indices_index += 1 {
             idx := &attrib.faces[indices_index];
+            v := 3 * idx.v_idx;
+            t := 2 * idx.vt_idx;
             new_vertex := Vertex {
-                {
-                    attrib.vertices[3 * idx.v_idx + 0],
-                    attrib.vertices[3 * idx.v_idx + 1],
-                    attrib.vertices[3 * idx.v_idx + 2],
-                },
+                { attrib.vertices[v], attrib.vertices[v + 1], attrib.vertices[v + 2], },
                 { 1, 1, 1, },
-                {
-                    attrib.texcoords[2 * idx.vt_idx + 0],
-                    1.0 - attrib.texcoords[2 * idx.vt_idx + 1],
-                },
+                { attrib.texcoords[t], 1.0 - attrib.texcoords[t + 1], },
             };
 
-            seen := false;
-            pos := 0;
-            if REUSE_VERTS {
-                for i in 0..vertex_index - 1 {
-                    if (Vertex_eq(&new_vertex, &vertices[i])) {
-                        seen = true;
-                        pos = i;
-                    }
-                }
-            }
-
-            if seen {
-                indices[indices_index] = cast(u32)pos;
+            hashed_vertex := Vertex_hash(&new_vertex);
+            if seen_pos, found := unique_vertices[hashed_vertex]; found {
+                indices[indices_index] = seen_pos;
             } else {
-                vertices[vertex_index] = new_vertex;
-                indices[indices_index] = cast(u32)vertex_index;
+                append(&vertices, new_vertex);
+                indices[indices_index] = vertex_index;
+                unique_vertices[hashed_vertex] = vertex_index;
                 vertex_index += 1;
             }
 
         }
-
     }
 
     // create vertex buffer
