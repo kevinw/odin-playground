@@ -1,6 +1,5 @@
 package tinyobj
 
-import "core:fmt"
 import "core:mem"
 import "core:os"
 
@@ -98,8 +97,6 @@ parse :: proc(
     num_materials: uint;
     _attrib: _Attrib;
 
-    fmt.println("num bytes:", len(buf));
-    
     res := parse_obj(&_attrib, &shapes_ptr, &num_shapes, &materials_ptr, &num_materials,
         &buf[0], cast(uint)len(buf), flags);
 
@@ -109,9 +106,9 @@ parse :: proc(
         {
             using _attrib;
             attrib^ = Attrib {
-                vertices = mem.slice_ptr(vertices, cast(int)num_vertices),
-                normals = mem.slice_ptr(normals, cast(int)num_normals),
-                texcoords = mem.slice_ptr(texcoords, cast(int)num_texcoords),
+                vertices = mem.slice_ptr(vertices, cast(int)num_vertices * 3),
+                normals = mem.slice_ptr(normals, cast(int)num_normals * 3),
+                texcoords = mem.slice_ptr(texcoords, cast(int)num_texcoords * 2),
                 faces = mem.slice_ptr(faces, cast(int)num_faces),
                 face_num_verts = mem.slice_ptr(face_num_verts, cast(int)num_face_num_verts),
             };

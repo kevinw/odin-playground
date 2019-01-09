@@ -10,8 +10,6 @@ import "core:math"
 import "core:mem"
 import "core:os"
 import "core:bits"
-import "core:math/rand"
-
 
 import vk "./vulkan_bindings"
 import "./vk_util"
@@ -53,6 +51,10 @@ Vertex :: struct #packed {
     pos: math.Vec3,
     color: math.Vec3,
     tex_coord: math.Vec2,
+}
+
+Vertex_eq :: inline proc(a: ^Vertex, b: ^Vertex) -> bool {
+    return a.pos == b.pos && a.color == b.color && a.tex_coord == b.tex_coord;
 }
 
 Vertex_binding_description :: proc() -> vk.Vertex_Input_Binding_Description {
@@ -1386,42 +1388,55 @@ run :: proc() -> int {
             err_exit("Error parsing OBJ file.");
         }
 
-        //fmt.println("parsed model with", len(attrib.vertices), "vertices");
-
         // assume triangles
         assert(len(attrib.faces) % 3 == 0); // assume triangulation
         assert(len(shapes) == 1); // TODO: handle multiple shapes
 
-        actual_num_verts := len(attrib.vertices) / 3;
-        actual_num_indices := len(attrib.faces) / 3;
+        num_faces := len(attrib.faces);
 
-        vertices = make([]Vertex, actual_num_verts);
-        indices = make([]u32, actual_num_indices);
+        REUSE_VERTS :: false;
 
-        rnd_state := rand.Rand {};
-        rand.init(&rnd_state, 424242);
+        vertices = make([]Vertex, num_faces);
+        indices = make([]u32, num_faces);
 
-        for i := 0; i < len(vertices); i += 1 {
-            vertices[i] = Vertex{
-                pos = {
-                    attrib.vertices[i * 3 + 0],
-                    attrib.vertices[i * 3 + 1],
-                    attrib.vertices[i * 3 + 2]
+        vertex_index := 0;
+
+        for indices_index := 0; indices_index < num_faces; indices_index += 1 {
+            idx := &attrib.faces[indices_index];
+            new_vertex := Vertex {
+                {
+                    attrib.vertices[3 * idx.v_idx + 0],
+                    attrib.vertices[3 * idx.v_idx + 1],
+                    attrib.vertices[3 * idx.v_idx + 2],
                 },
-                color = {
-                    rand.float32(&rnd_state),
-                    rand.float32(&rnd_state),
-                    rand.float32(&rnd_state), // col
-                },
-                tex_coord = {
-                    0, 0, // uv
+                { 1, 1, 1, },
+                {
+                    attrib.texcoords[2 * idx.vt_idx + 0],
+                    1.0 - attrib.texcoords[2 * idx.vt_idx + 1],
                 },
             };
+
+            seen := false;
+            pos := 0;
+            if REUSE_VERTS {
+                for i in 0..vertex_index - 1 {
+                    if (Vertex_eq(&new_vertex, &vertices[i])) {
+                        seen = true;
+                        pos = i;
+                    }
+                }
+            }
+
+            if seen {
+                indices[indices_index] = cast(u32)pos;
+            } else {
+                vertices[vertex_index] = new_vertex;
+                indices[indices_index] = cast(u32)vertex_index;
+                vertex_index += 1;
+            }
+
         }
 
-        for i := 0; i < len(indices); i += 1 {
-            indices[i] = cast(u32)attrib.faces[i].v_idx;
-        }
     }
 
     // create vertex buffer
