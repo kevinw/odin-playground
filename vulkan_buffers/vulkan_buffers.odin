@@ -21,8 +21,6 @@ import tinyobj "../tinyobjloader_c"
 
 import "../path"
 
-log2 :: proc(n: f32) -> f32 { return math.log(n) / math.log(f32(2.0)); }
-
 // not included in the GLFW bindings, interacts with vulkan types
 @(default_calling_convention="c", link_prefix="glfw")
 foreign {
@@ -1468,32 +1466,34 @@ run :: proc() -> int {
 
         fmt.println("max push constants size:", max_push_constants_size); // spec requires 128 bytes[
 
-        queue_family_count: u32 = ---;
-        vk.get_physical_device_queue_family_properties(physical_device, &queue_family_count, nil);
-        queue_family_properties := make([]vk.Queue_Family_Properties, queue_family_count);
-        defer delete(queue_family_properties);
-        vk.get_physical_device_queue_family_properties(physical_device, &queue_family_count, &queue_family_properties[0]);
+        {
+            queue_family_count: u32 = ---;
+            vk.get_physical_device_queue_family_properties(physical_device, &queue_family_count, nil);
+            queue_family_properties := make([]vk.Queue_Family_Properties, queue_family_count);
+            defer delete(queue_family_properties);
+            vk.get_physical_device_queue_family_properties(physical_device, &queue_family_count, &queue_family_properties[0]);
 
-        found_graphics := false;
-        found_present := false;
+            found_graphics := false;
+            found_present := false;
 
-        for _, i in queue_family_properties {
-            if !found_graphics && queue_family_properties[i].queue_count > 0 && vk.Queue_Flag.Graphics in queue_family_properties[i].queue_flags {
-                graphics_family_index = u32(i);
-                found_graphics = true;
-            }
+            for _, i in queue_family_properties {
+                if !found_graphics && queue_family_properties[i].queue_count > 0 && vk.Queue_Flag.Graphics in queue_family_properties[i].queue_flags {
+                    graphics_family_index = u32(i);
+                    found_graphics = true;
+                }
 
-            if !found_present {
-                present_support : b32 = false;
-                vk.get_physical_device_surface_support_khr(physical_device, u32(i), surface, &present_support);
-                if queue_family_properties[i].queue_count > 0 && present_support {
-                    present_family_index = u32(i);
-                    found_present = true;
+                if !found_present {
+                    present_support : b32 = false;
+                    vk.get_physical_device_surface_support_khr(physical_device, u32(i), surface, &present_support);
+                    if queue_family_properties[i].queue_count > 0 && present_support {
+                        present_family_index = u32(i);
+                        found_present = true;
+                    }
                 }
             }
+            if !found_graphics do err_exit("No Vulkan graphics queue found.");;
+            if !found_present do err_exit("No Vulkan present queue found.");
         }
-        if !found_graphics do err_exit("No Vulkan graphics queue found.");;
-        if !found_present do err_exit("No Vulkan present queue found.");
 
         // specify queues to be created
         queue_create_infos: [dynamic]vk.Device_Queue_Create_Info;
@@ -1880,6 +1880,8 @@ run :: proc() -> int {
                     // constants"
                     using math;
                     time_since_start := current_time - start_time;
+
+
                     ubo := Uniform_Buffer_Object {
                         model = mat4_rotate(Vec3{0, 0, 1}, to_radians(90) * f32(time_since_start)),
                         view = look_at(Vec3{2, 2, 2}, Vec3{0, 0, 0}, Vec3{0, 0, 1}),
@@ -1930,7 +1932,7 @@ run :: proc() -> int {
                         || result == vk.Result.Suboptimal_KHR
                         || framebuffer_resized
                     {
-                        fmt.println("recreating swapchain because of queue_present_khr result");
+                        fmt.println("recreating swapchain");
                         framebuffer_resized = false;
                         recreate_swapchain(window);
                     }
