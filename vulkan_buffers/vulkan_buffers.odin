@@ -233,7 +233,8 @@ err_exit :: inline proc(message: string, return_code:int = -1) -> int {
     return -1;
 }
 
-// TODO: probably should be a struct
+
+// TODO: expand into a series of structs
 device: vk.Device;
 swapchain: vk.Swapchain_KHR;
 physical_device: vk.Physical_Device;
@@ -278,8 +279,38 @@ texture_sampler: vk.Sampler;
 vertices : [dynamic]Vertex;
 indices : []u32;
 
+msaa_samples : vk.Sample_Count_Flag;
+max_push_constants_size: u32;
+
+color_image: vk.Image;
+color_image_memory: vk.Device_Memory;
+color_image_view: vk.Image_View;
+
+
+get_max_usable_sample_count :: proc(props: vk.Physical_Device_Properties) -> vk.Sample_Count_Flag {
+    using props.limits;
+
+    counts : vk.Sample_Count_Flags;
+    if framebuffer_color_sample_counts < framebuffer_depth_sample_counts {
+        counts = framebuffer_color_sample_counts;
+    } else {
+        counts = framebuffer_depth_sample_counts;
+    }
+
+    if vk.Sample_Count_Flag._64 in counts do return vk.Sample_Count_Flag._64;
+    if vk.Sample_Count_Flag._32 in counts do return vk.Sample_Count_Flag._32;
+    if vk.Sample_Count_Flag._16 in counts do return vk.Sample_Count_Flag._16;
+    if vk.Sample_Count_Flag._8 in counts do return vk.Sample_Count_Flag._8;
+    if vk.Sample_Count_Flag._4 in counts do return vk.Sample_Count_Flag._4;
+    if vk.Sample_Count_Flag._2 in counts do return vk.Sample_Count_Flag._2;
+    return vk.Sample_Count_Flag._1;
+}
 
 cleanup_swapchain :: proc() {
+    vk.destroy_image_view(device, color_image_view, nil);
+    vk.destroy_image(device, color_image, nil);
+    vk.free_memory(device, color_image_memory, nil);
+
     vk.destroy_image_view(device, depth_image_view, nil);
     vk.destroy_image(device, depth_image, nil);
     vk.free_memory(device, depth_image_memory, nil);
@@ -408,13 +439,14 @@ recreate_swapchain :: proc(window: glfw.Window_Handle, first_run:bool = false) {
 
         color_attachment := vk.Attachment_Description {
             format = swapchain_image_format,
-            samples = {vk.Sample_Count_Flag._1},
+            samples = {msaa_samples},
+
             load_op = vk.Attachment_Load_Op.Clear,
             store_op = vk.Attachment_Store_Op.Store,
             stencil_load_op = vk.Attachment_Load_Op.Dont_Care,
             stencil_store_op = vk.Attachment_Store_Op.Dont_Care,
             initial_layout = vk.Image_Layout.Undefined,
-            final_layout = vk.Image_Layout.Present_Src_KHR,
+            final_layout = vk.Image_Layout.Color_Attachment_Optimal,
         };
 
         // subpasses
@@ -425,7 +457,7 @@ recreate_swapchain :: proc(window: glfw.Window_Handle, first_run:bool = false) {
 
         depth_attachment := vk.Attachment_Description {
             format = vk_util.find_depth_format(physical_device),
-            samples = {vk.Sample_Count_Flag._1},
+            samples = {msaa_samples},
             load_op = vk.Attachment_Load_Op.Clear,
             store_op = vk.Attachment_Store_Op.Dont_Care, // depth won't be read after drawing is finished, may allow additional optimizations
             stencil_load_op = vk.Attachment_Load_Op.Dont_Care,
@@ -439,17 +471,34 @@ recreate_swapchain :: proc(window: glfw.Window_Handle, first_run:bool = false) {
             layout = vk.Image_Layout.Depth_Stencil_Attachment_Optimal,
         };
 
+        color_attachment_resolve := vk.Attachment_Description {
+            format = swapchain_image_format,
+            samples = {vk.Sample_Count_Flag._1},
+            load_op = vk.Attachment_Load_Op.Dont_Care,
+            store_op = vk.Attachment_Store_Op.Store,
+            stencil_load_op = vk.Attachment_Load_Op.Dont_Care,
+            stencil_store_op = vk.Attachment_Store_Op.Dont_Care,
+            initial_layout = vk.Image_Layout.Undefined,
+            final_layout = vk.Image_Layout.Present_Src_KHR,
+        };
+
+        color_attachment_resolve_ref := vk.Attachment_Reference {
+            attachment = 2,
+            layout = vk.Image_Layout.Color_Attachment_Optimal,
+        };
+
         subpass := vk.Subpass_Description {
             pipeline_bind_point = vk.Pipeline_Bind_Point.Graphics,
             color_attachment_count = 1,
             color_attachments = &color_attachment_ref,
             depth_stencil_attachment = &depth_attachment_ref,
+            resolve_attachments = &color_attachment_resolve_ref,
             //input_attachments
-            //resolve_attachments
             //preserve_attachments
         };
 
-        attachments := [2]vk.Attachment_Description { color_attachment, depth_attachment };
+        attachments := [3]vk.Attachment_Description {
+            color_attachment, depth_attachment, color_attachment_resolve };
 
         render_pass_info := vk.Render_Pass_Create_Info {
             s_type = vk.Structure_Type.Render_Pass_Create_Info,
@@ -699,7 +748,7 @@ recreate_swapchain :: proc(window: glfw.Window_Handle, first_run:bool = false) {
         multisampling := vk.Pipeline_Multisample_State_Create_Info {
             s_type = vk.Structure_Type.Pipeline_Multisample_State_Create_Info,
             sample_shading_enable = false,
-            rasterization_samples = {vk.Sample_Count_Flag._1},
+            rasterization_samples = {msaa_samples},
             min_sample_shading = 1,
             sample_mask = nil,
             alpha_to_coverage_enable = false,
@@ -753,6 +802,14 @@ recreate_swapchain :: proc(window: glfw.Window_Handle, first_run:bool = false) {
         };
         */
 
+        /*
+        push_constant_range := vk.Push_Constant_Range {
+            stage_flags = {vk.Shader_Stage_Flag.Vertex},
+            offset := 0,
+            size := 0,
+        };
+        */
+
         pipeline_layout_info := vk.Pipeline_Layout_Create_Info {
             s_type = vk.Structure_Type.Pipeline_Layout_Create_Info,
             set_layout_count = 1,
@@ -760,6 +817,7 @@ recreate_swapchain :: proc(window: glfw.Window_Handle, first_run:bool = false) {
             push_constant_range_count = 0, //optional
             push_constant_ranges = nil, // optional
         };
+
 
         check_vk_success(vk.create_pipeline_layout(device, &pipeline_layout_info, nil, &pipeline_layout),
             "Failed to create pipeline layout.");
@@ -802,11 +860,33 @@ recreate_swapchain :: proc(window: glfw.Window_Handle, first_run:bool = false) {
         check_vk_success(vk.create_graphics_pipelines(device, nil, 1, &graphics_pipeline_info, nil, &graphics_pipeline),
             "Failed to create graphics pipeline.");
     }
+
+    // create color resources
+    {
+        color_format: vk.Format = swapchain_image_format;
+        vk_util.create_image(
+            device, physical_device,
+            swapchain_extent.width, swapchain_extent.height, 1,
+            msaa_samples, color_format,
+            vk.Image_Tiling.Optimal,
+            {vk.Image_Usage_Flag.Transient_Attachment, vk.Image_Usage_Flag.Color_Attachment},
+            {vk.Memory_Property_Flag.Device_Local},
+            &color_image,
+            &color_image_memory);
+
+        color_image_view = vk_util.create_image_view(
+            device, color_image, color_format,
+            {vk.Image_Aspect_Flag.Color}, 1);
+
+        transition_image_layout(color_image, color_format, vk.Image_Layout.Undefined, vk.Image_Layout.Color_Attachment_Optimal, 1);
+    }
+
     
     // create depth resources
     {
         depth_format := vk_util.find_depth_format(physical_device);
-        vk_util.create_image(device, physical_device, swapchain_extent.width, swapchain_extent.height, mip_levels,
+        vk_util.create_image(device, physical_device, swapchain_extent.width, swapchain_extent.height, 1,
+            msaa_samples,
             depth_format,
             vk.Image_Tiling.Optimal,
             {vk.Image_Usage_Flag.Depth_Stencil_Attachment},
@@ -815,9 +895,7 @@ recreate_swapchain :: proc(window: glfw.Window_Handle, first_run:bool = false) {
             &depth_image_memory);
 
         depth_image_view = vk_util.create_image_view(device, depth_image, depth_format, {vk.Image_Aspect_Flag.Depth}, 1);
-        fmt.println("transitioning depth");
         transition_image_layout(depth_image, depth_format, vk.Image_Layout.Undefined, vk.Image_Layout.Depth_Stencil_Attachment_Optimal, 1);
-        fmt.println("DONE transitioning depth");
     }
 
     // create framebuffers
@@ -828,7 +906,11 @@ recreate_swapchain :: proc(window: glfw.Window_Handle, first_run:bool = false) {
             // same depth image can be used by all of them because only a
             // single subpass is running at the same time due to our
             // semaphores.
-            attachments := [2]vk.Image_View { swapchain_imageviews[i], depth_image_view };
+            attachments := [3]vk.Image_View {
+                color_image_view,
+                depth_image_view,
+                swapchain_imageviews[i],
+            };
 
             framebuffer_info := vk.Framebuffer_Create_Info {
                 s_type = vk.Structure_Type.Framebuffer_Create_Info,
@@ -1066,6 +1148,12 @@ transition_image_layout :: proc(image: vk.Image, format: vk.Format, old_layout: 
 
         source_stage = {vk.Pipeline_Stage_Flag.Top_Of_Pipe}; // earliest possible stage
         destination_stage = {vk.Pipeline_Stage_Flag.Early_Fragment_Tests};
+    } else if old_layout == vk.Image_Layout.Undefined && new_layout == vk.Image_Layout.Color_Attachment_Optimal {
+        barrier.src_access_mask = {};
+        barrier.dst_access_mask = {vk.Access_Flag.Color_Attachment_Read, vk.Access_Flag.Color_Attachment_Write};
+
+        source_stage = {vk.Pipeline_Stage_Flag.Top_Of_Pipe};
+        destination_stage = {vk.Pipeline_Stage_Flag.Color_Attachment_Output};
     } else {
         err_exit("Unsupported layout transition.");
     }
@@ -1369,12 +1457,16 @@ run :: proc() -> int {
             physical_device_name := cstring(&physical_device_properties.device_name[0]);
             if !found_physical_device && is_device_suitable(devices[i], surface) {
                 physical_device = devices[i];
+                msaa_samples = get_max_usable_sample_count(physical_device_properties);
+                max_push_constants_size = physical_device_properties.limits.max_push_constants_size;
                 found_physical_device = true;
                 fmt.println("device:", physical_device_name, "<-- USING THIS DEVICE");
             } else {
                 fmt.println("device:", physical_device_name);
             }
         }
+
+        fmt.println("max push constants size:", max_push_constants_size); // spec requires 128 bytes[
 
         queue_family_count: u32 = ---;
         vk.get_physical_device_queue_family_properties(physical_device, &queue_family_count, nil);
@@ -1632,7 +1724,6 @@ run :: proc() -> int {
         defer stbi.image_free(image_data);
 
         mip_levels = u32(math.floor(math.log(f32(max(image_width, image_height))))) + 1;
-        fmt.println("mip_levels", mip_levels);
 
         BYTES_PER_PIXEL :: 4;
 
@@ -1657,6 +1748,7 @@ run :: proc() -> int {
         }
 
         vk_util.create_image(device, physical_device, u32(image_width), u32(image_height), mip_levels,
+            vk.Sample_Count_Flag._1,
             texture_format,
             vk.Image_Tiling.Optimal,
             {

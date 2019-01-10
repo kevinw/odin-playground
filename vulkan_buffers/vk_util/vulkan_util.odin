@@ -39,6 +39,7 @@ create_image :: proc(
     physical_device: vk.Physical_Device,
     width, height: u32,
     mip_levels: u32,
+    num_samples: vk.Sample_Count_Flag,
     format: vk.Format,
     image_tiling: vk.Image_Tiling,
     usage: vk.Image_Usage_Flags,
@@ -57,7 +58,7 @@ create_image :: proc(
         initial_layout = vk.Image_Layout.Undefined,
         usage = usage,
         sharing_mode = vk.Sharing_Mode.Exclusive,
-        samples = {vk.Sample_Count_Flag._1},
+        samples = {num_samples},
         flags = {}, // sparse voxel terrains, etc
     };
 
