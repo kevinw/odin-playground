@@ -21,6 +21,8 @@ import tinyobj "../tinyobjloader_c"
 
 import "../path"
 
+log2 :: proc(n: f32) -> f32 { return math.log(n) / math.log(f32(2.0)); }
+
 // not included in the GLFW bindings, interacts with vulkan types
 @(default_calling_convention="c", link_prefix="glfw")
 foreign {
@@ -267,6 +269,7 @@ descriptor_set_layout: vk.Descriptor_Set_Layout;
 descriptor_pool: vk.Descriptor_Pool;
 descriptor_sets: []vk.Descriptor_Set;
 
+mip_levels: u32;
 texture_image: vk.Image;
 texture_image_memory: vk.Device_Memory;
 texture_image_view: vk.Image_View;
@@ -379,7 +382,7 @@ recreate_swapchain :: proc(window: glfw.Window_Handle, first_run:bool = false) {
         {
             swapchain_imageviews = make([]vk.Image_View, len(swapchain_images));
             for _, i in swapchain_images {
-                swapchain_imageviews[i] = vk_util.create_image_view(device, swapchain_images[i], swapchain_image_format, {vk.Image_Aspect_Flag.Color});
+                swapchain_imageviews[i] = vk_util.create_image_view(device, swapchain_images[i], swapchain_image_format, {vk.Image_Aspect_Flag.Color}, 1);
                 /* TODO: If you were working on a stereographic 3D
                 * application, then you would create a swap chain with
                 * multiple layers. You could then create multiple image
@@ -803,7 +806,7 @@ recreate_swapchain :: proc(window: glfw.Window_Handle, first_run:bool = false) {
     // create depth resources
     {
         depth_format := vk_util.find_depth_format(physical_device);
-        vk_util.create_image(device, physical_device, swapchain_extent.width, swapchain_extent.height,
+        vk_util.create_image(device, physical_device, swapchain_extent.width, swapchain_extent.height, mip_levels,
             depth_format,
             vk.Image_Tiling.Optimal,
             {vk.Image_Usage_Flag.Depth_Stencil_Attachment},
@@ -811,8 +814,10 @@ recreate_swapchain :: proc(window: glfw.Window_Handle, first_run:bool = false) {
             &depth_image,
             &depth_image_memory);
 
-        depth_image_view = vk_util.create_image_view(device, depth_image, depth_format, {vk.Image_Aspect_Flag.Depth});
-        transition_image_layout(depth_image, depth_format, vk.Image_Layout.Undefined, vk.Image_Layout.Depth_Stencil_Attachment_Optimal);
+        depth_image_view = vk_util.create_image_view(device, depth_image, depth_format, {vk.Image_Aspect_Flag.Depth}, 1);
+        fmt.println("transitioning depth");
+        transition_image_layout(depth_image, depth_format, vk.Image_Layout.Undefined, vk.Image_Layout.Depth_Stencil_Attachment_Optimal, 1);
+        fmt.println("DONE transitioning depth");
     }
 
     // create framebuffers
@@ -1012,7 +1017,7 @@ perspective_vulkan :: proc(fovy, aspect, near, far: f32) -> math.Mat4 {
 	return m;
 }
 
-transition_image_layout :: proc(image: vk.Image, format: vk.Format, old_layout: vk.Image_Layout, new_layout: vk.Image_Layout) {
+transition_image_layout :: proc(image: vk.Image, format: vk.Format, old_layout: vk.Image_Layout, new_layout: vk.Image_Layout, mip_levels: u32) {
     command_buffer := begin_single_time_commands();
     defer end_single_time_commands_and_wait(command_buffer);
 
@@ -1026,7 +1031,7 @@ transition_image_layout :: proc(image: vk.Image, format: vk.Format, old_layout: 
         subresource_range = {
             //aspect_mask = {vk.Image_Aspect_Flag.Color},
             base_mip_level = 0,
-            level_count = 1,
+            level_count = mip_levels,
             base_array_layer = 0,
             layer_count = 1,
         },
@@ -1102,6 +1107,104 @@ copy_buffer_to_image :: proc(buffer: vk.Buffer, image: vk.Image, width, height: 
         vk.Image_Layout.Transfer_Dst_Optimal,
         1,
         &region);
+}
+
+generate_mipmaps :: proc(image: vk.Image, image_format: vk.Format, tex_width: i32, tex_height: i32, mip_levels: u32) {
+    // check if image format supports linear blitting
+    format_properties : vk.Format_Properties = ---;
+    vk.get_physical_device_format_properties(physical_device, image_format, &format_properties);
+    if !(vk.Format_Feature_Flag.Sampled_Image_Filter_Linear in format_properties.optimal_tiling_features) {
+        err_exit("Texture image format does not support linear blitting.");
+    }
+
+    command_buffer := begin_single_time_commands();
+    defer end_single_time_commands_and_wait(command_buffer);
+
+    barrier := vk.Image_Memory_Barrier {
+        s_type = vk.Structure_Type.Image_Memory_Barrier,
+        image = image,
+        src_queue_family_index = vk.QUEUE_FAMILY_IGNORED,
+        dst_queue_family_index = vk.QUEUE_FAMILY_IGNORED,
+        subresource_range = {
+            aspect_mask = {vk.Image_Aspect_Flag.Color},
+            base_array_layer = 0,
+            layer_count = 1,
+            level_count = 1
+        }
+    };
+
+    mip_width := tex_width;
+    mip_height := tex_height;
+
+    for i := u32(1); i < mip_levels; i += 1 {
+        barrier.subresource_range.base_mip_level = i - 1;
+        barrier.old_layout = vk.Image_Layout.Transfer_Dst_Optimal;
+        barrier.new_layout = vk.Image_Layout.Transfer_Src_Optimal;
+        barrier.src_access_mask = {vk.Access_Flag.Transfer_Write};
+        barrier.dst_access_mask = {vk.Access_Flag.Transfer_Read};
+
+        vk.cmd_pipeline_barrier(command_buffer,
+            {vk.Pipeline_Stage_Flag.Transfer}, {vk.Pipeline_Stage_Flag.Transfer}, {},
+            0, nil,
+            0, nil,
+            1, &barrier);
+
+        blit := vk.Image_Blit {
+            src_offsets = {
+                { 0, 0, 0, },
+                { mip_width, mip_height, 1 },
+            },
+            src_subresource = {
+                aspect_mask = {vk.Image_Aspect_Flag.Color},
+                mip_level = i - 1,
+                base_array_layer = 0,
+                layer_count = 1,
+            },
+            dst_offsets = {
+                { 0, 0, 0, },
+                { mip_width > 1 ? mip_width / 2 : 1, mip_height > 1 ? mip_height / 2 : 1, 1 },
+            },
+            dst_subresource = {
+                aspect_mask = {vk.Image_Aspect_Flag.Color},
+                mip_level = i,
+                base_array_layer = 0,
+                layer_count = 1,
+            },
+        };
+
+        vk.cmd_blit_image(command_buffer,
+            image, vk.Image_Layout.Transfer_Src_Optimal,
+            image, vk.Image_Layout.Transfer_Dst_Optimal,
+            1, &blit,
+            vk.Filter.Linear,
+        );
+
+        barrier.old_layout = vk.Image_Layout.Transfer_Src_Optimal;
+        barrier.new_layout = vk.Image_Layout.Shader_Read_Only_Optimal;
+        barrier.src_access_mask = {vk.Access_Flag.Transfer_Read};
+        barrier.dst_access_mask = {vk.Access_Flag.Shader_Read};
+
+        vk.cmd_pipeline_barrier(command_buffer,
+            {vk.Pipeline_Stage_Flag.Transfer}, {vk.Pipeline_Stage_Flag.Fragment_Shader}, {},
+            0, nil,
+            0, nil,
+            1, &barrier);
+
+        if mip_width > 1 do mip_width /= 2;
+        if mip_height > 1 do mip_height /= 2;
+    }
+
+    barrier.subresource_range.base_mip_level = mip_levels - 1;
+    barrier.old_layout = vk.Image_Layout.Transfer_Dst_Optimal;
+    barrier.new_layout = vk.Image_Layout.Shader_Read_Only_Optimal;
+    barrier.src_access_mask = {vk.Access_Flag.Transfer_Write};
+    barrier.dst_access_mask = {vk.Access_Flag.Shader_Read};
+
+    vk.cmd_pipeline_barrier(command_buffer,
+        {vk.Pipeline_Stage_Flag.Transfer}, {vk.Pipeline_Stage_Flag.Fragment_Shader}, {},
+        0, nil,
+        0, nil,
+        1, &barrier);
 }
 
 run :: proc() -> int {
@@ -1528,6 +1631,9 @@ run :: proc() -> int {
         if image_data == nil || image_width < 1 || image_height < 1 do err_exit("Could not load texture");
         defer stbi.image_free(image_data);
 
+        mip_levels = u32(math.floor(math.log(f32(max(image_width, image_height))))) + 1;
+        fmt.println("mip_levels", mip_levels);
+
         BYTES_PER_PIXEL :: 4;
 
         staging_buffer: vk.Buffer = ---;
@@ -1550,22 +1656,28 @@ run :: proc() -> int {
             vk.unmap_memory(device, staging_buffer_memory);
         }
 
-        vk_util.create_image(device, physical_device, u32(image_width), u32(image_height),
+        vk_util.create_image(device, physical_device, u32(image_width), u32(image_height), mip_levels,
             texture_format,
             vk.Image_Tiling.Optimal,
-            {vk.Image_Usage_Flag.Transfer_Dst, vk.Image_Usage_Flag.Sampled},
-            {vk.Memory_Property_Flag.Device_Local},
+            {
+                vk.Image_Usage_Flag.Transfer_Src,
+                vk.Image_Usage_Flag.Transfer_Dst,
+                vk.Image_Usage_Flag.Sampled,
+            },
+            {
+                vk.Memory_Property_Flag.Device_Local,
+            },
             &texture_image,
             &texture_image_memory);
 
-        transition_image_layout(texture_image, texture_format, vk.Image_Layout.Undefined, vk.Image_Layout.Transfer_Dst_Optimal);
+        transition_image_layout(texture_image, texture_format, vk.Image_Layout.Undefined, vk.Image_Layout.Transfer_Dst_Optimal, mip_levels);
         copy_buffer_to_image(staging_buffer, texture_image, u32(image_width), u32(image_height));
-        transition_image_layout(texture_image, texture_format, vk.Image_Layout.Transfer_Dst_Optimal, vk.Image_Layout.Shader_Read_Only_Optimal);
+        generate_mipmaps(texture_image, texture_format, image_width, image_height, mip_levels);
     }
 
     // create texture image view
     {
-        texture_image_view = vk_util.create_image_view(device, texture_image, texture_format, {vk.Image_Aspect_Flag.Color});
+        texture_image_view = vk_util.create_image_view(device, texture_image, texture_format, {vk.Image_Aspect_Flag.Color}, mip_levels);
     }
 
     // create texture sampler
@@ -1588,7 +1700,7 @@ run :: proc() -> int {
             mipmap_mode = vk.Sampler_Mipmap_Mode.Linear,
             mip_lod_bias = 0,
             min_lod = 0,
-            max_lod = 0,
+            max_lod = f32(mip_levels),
         };
 
         check_vk_success(vk.create_sampler(device, &sampler_info, nil, &texture_sampler),

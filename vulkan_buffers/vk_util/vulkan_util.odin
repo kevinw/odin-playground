@@ -38,6 +38,7 @@ create_image :: proc(
     device: vk.Device,
     physical_device: vk.Physical_Device,
     width, height: u32,
+    mip_levels: u32,
     format: vk.Format,
     image_tiling: vk.Image_Tiling,
     usage: vk.Image_Usage_Flags,
@@ -49,7 +50,7 @@ create_image :: proc(
         s_type = vk.Structure_Type.Image_Create_Info,
         image_type = vk.Image_Type.D2,
         extent = { width = width, height = height, depth = 1, },
-        mip_levels = 1,
+        mip_levels = mip_levels,
         array_layers = 1,
         format = format,
         tiling = image_tiling,
@@ -84,6 +85,7 @@ create_image_view :: proc(
     image: vk.Image,
     format: vk.Format,
     aspect_flags: vk.Image_Aspect_Flags,
+    mip_levels: u32,
 ) -> vk.Image_View
 {
     view_info := vk.Image_View_Create_Info {
@@ -94,17 +96,15 @@ create_image_view :: proc(
         subresource_range = {
             aspect_mask = aspect_flags,
             base_mip_level = 0,
-            level_count = 1,
+            level_count = mip_levels,
             base_array_layer = 0,
             layer_count = 1,
         }
     };
-
     image_view: vk.Image_View = ---;
     check_vk_success(vk.create_image_view(device, &view_info, nil, &image_view),
         "Failed to create texture image view.");
     return image_view;
-
 }
 
 find_supported_format :: proc(
