@@ -20,6 +20,26 @@ check_vk_success :: inline proc (res: vk.Result, message: string) {
     if res != vk.Result.Success do err_exit(message);
 }
 
+get_max_usable_sample_count :: proc(props: vk.Physical_Device_Properties) -> vk.Sample_Count_Flag {
+    using props.limits;
+
+    counts : vk.Sample_Count_Flags;
+    if framebuffer_color_sample_counts < framebuffer_depth_sample_counts {
+        counts = framebuffer_color_sample_counts;
+    } else {
+        counts = framebuffer_depth_sample_counts;
+    }
+
+    if vk.Sample_Count_Flag._64 in counts do return vk.Sample_Count_Flag._64;
+    if vk.Sample_Count_Flag._32 in counts do return vk.Sample_Count_Flag._32;
+    if vk.Sample_Count_Flag._16 in counts do return vk.Sample_Count_Flag._16;
+    if vk.Sample_Count_Flag._8 in counts do return vk.Sample_Count_Flag._8;
+    if vk.Sample_Count_Flag._4 in counts do return vk.Sample_Count_Flag._4;
+    if vk.Sample_Count_Flag._2 in counts do return vk.Sample_Count_Flag._2;
+    return vk.Sample_Count_Flag._1;
+}
+
+
 find_memory_type :: proc(physical_device: vk.Physical_Device, type_filter: u32, properties: vk.Memory_Property_Flags) -> u32 {
     mem_properties: vk.Physical_Device_Memory_Properties = ---;
     vk.get_physical_device_memory_properties(physical_device, &mem_properties);

@@ -38,6 +38,7 @@ check_vk_success :: inline proc (res: vk.Result, message: string) {
     if res != vk.Result.Success do err_exit(message);
 }
 
+NUM_VIEWPORTS :: 1;
 WINDOW_TITLE := "vulkan_buffers";
 VALIDATION_LAYERS_ENABLED :: true;
 MAX_FRAMES_IN_FLIGHT :: 2;
@@ -45,6 +46,13 @@ WIDTH :: 1280;
 HEIGHT :: 720;
 MODEL_PATH :: "vulkan_buffers/models/chalet.obj";
 TEXTURE_PATH :: "vulkan_buffers/textures/chalet.jpg";
+
+@(private)
+LOGICAL_DEVICE_FEATURES := vk.Physical_Device_Features {
+    sampler_anisotropy = true,
+    multi_viewport = true,
+};
+
 
 Vertex :: struct #packed {
     // an example of "interleaving vertex attributes"
@@ -78,7 +86,7 @@ Vertex_binding_description :: proc() -> vk.Vertex_Input_Binding_Description {
 }
 
 Uniform_Buffer_Object :: struct #packed {
-    model, view, proj: math.Mat4,
+    model, view, proj: [NUM_VIEWPORTS]math.Mat4,
 }
 
 framebuffer_resize_callback :: proc "c" (window: glfw.Window_Handle, width, height: i32) {
@@ -152,6 +160,9 @@ is_device_suitable :: proc(device: vk.Physical_Device, surface: vk.Surface_KHR) 
     supported_features: vk.Physical_Device_Features = ---;
     vk.get_physical_device_features(device, &supported_features);
     if !supported_features.sampler_anisotropy do return false;
+
+    // make sure we have multiple viewports
+    if !supported_features.multi_viewport do return false;
 
     return true;
 }
@@ -283,26 +294,6 @@ max_push_constants_size: u32;
 color_image: vk.Image;
 color_image_memory: vk.Device_Memory;
 color_image_view: vk.Image_View;
-
-
-get_max_usable_sample_count :: proc(props: vk.Physical_Device_Properties) -> vk.Sample_Count_Flag {
-    using props.limits;
-
-    counts : vk.Sample_Count_Flags;
-    if framebuffer_color_sample_counts < framebuffer_depth_sample_counts {
-        counts = framebuffer_color_sample_counts;
-    } else {
-        counts = framebuffer_depth_sample_counts;
-    }
-
-    if vk.Sample_Count_Flag._64 in counts do return vk.Sample_Count_Flag._64;
-    if vk.Sample_Count_Flag._32 in counts do return vk.Sample_Count_Flag._32;
-    if vk.Sample_Count_Flag._16 in counts do return vk.Sample_Count_Flag._16;
-    if vk.Sample_Count_Flag._8 in counts do return vk.Sample_Count_Flag._8;
-    if vk.Sample_Count_Flag._4 in counts do return vk.Sample_Count_Flag._4;
-    if vk.Sample_Count_Flag._2 in counts do return vk.Sample_Count_Flag._2;
-    return vk.Sample_Count_Flag._1;
-}
 
 cleanup_swapchain :: proc() {
     vk.destroy_image_view(device, color_image_view, nil);
@@ -787,10 +778,9 @@ recreate_swapchain :: proc(window: glfw.Window_Handle, first_run:bool = false) {
             blend_constants = {0, 0, 0, 0}, // optional
         };
 
-        /*
         dynamic_states := [2]vk.Dynamic_State {
             vk.Dynamic_State.Viewport,
-            vk.Dynamic_State.Line_Width,
+            vk.Dynamic_State.Scissor,
         };
 
         dynamic_state := vk.Pipeline_Dynamic_State_Create_Info {
@@ -798,7 +788,6 @@ recreate_swapchain :: proc(window: glfw.Window_Handle, first_run:bool = false) {
             dynamic_state_count = u32(len(dynamic_states)),
             dynamic_states = &dynamic_states[0],
         };
-        */
 
         /*
         push_constant_range := vk.Push_Constant_Range {
@@ -847,7 +836,7 @@ recreate_swapchain :: proc(window: glfw.Window_Handle, first_run:bool = false) {
             multisample_state = &multisampling,
             depth_stencil_state = &depth_stencil,
             color_blend_state = &color_blending,
-            dynamic_state = nil, // optional
+            dynamic_state = &dynamic_state, // optional
             layout = pipeline_layout,
             render_pass = render_pass,
             subpass = 0,
@@ -941,14 +930,15 @@ recreate_swapchain :: proc(window: glfw.Window_Handle, first_run:bool = false) {
 
     // start command buffer recording
     {
-        for _, i in command_buffers {
+        for command_buffer, i in command_buffers {
             begin_info := vk.Command_Buffer_Begin_Info {
                 s_type = vk.Structure_Type.Command_Buffer_Begin_Info,
                 flags = {vk.Command_Buffer_Usage_Flag.Simultaneous_Use},
                 inheritance_info = nil, // optional for secondary command buffers
             };
-            check_vk_success(vk.begin_command_buffer(command_buffers[i], &begin_info),
+            check_vk_success(vk.begin_command_buffer(command_buffer, &begin_info),
                 "Failed to begin recording command buffer");
+            defer check_vk_success(vk.end_command_buffer(command_buffer), "Failed to record command buffer.");
 
             // TODO: when odin's raw_union support is fixed, just use vk.Clear_Value here.
             // see https://gist.github.com/kevinw/122fb7d711ecfde75661e5d7b67d523e
@@ -970,20 +960,34 @@ recreate_swapchain :: proc(window: glfw.Window_Handle, first_run:bool = false) {
             };
 
             // Draw the triangle
-            vk.cmd_begin_render_pass(command_buffers[i], &render_pass_info, vk.Subpass_Contents.Inline);
-            vk.cmd_bind_pipeline(command_buffers[i], vk.Pipeline_Bind_Point.Graphics, graphics_pipeline);
+            vk.cmd_begin_render_pass(command_buffer, &render_pass_info, vk.Subpass_Contents.Inline);
+            defer vk.cmd_end_render_pass(command_buffer);
+
+            // Setup viewport/scissor
+            w, h := cast(f32)swapchain_extent.width, cast(f32)swapchain_extent.height;
+            viewport_width: f32 = w / cast(f32)NUM_VIEWPORTS;
+            viewports := [NUM_VIEWPORTS]vk.Viewport {
+                { 0, 0, viewport_width, h, 0, 1 },
+                //{ 0, 0, viewport_width, h, 0, 1 },
+            };
+            scissors := [NUM_VIEWPORTS]vk.Rect2D {
+                { offset = {i32(0 * viewport_width), 0}, extent = {cast(u32)viewport_width, swapchain_extent.height} },
+                //{ offset = {i32(1 * viewport_width), 0}, extent = {cast(u32)viewport_width, swapchain_extent.height}, },
+            };
+            vk.cmd_set_viewport(command_buffer, 0, NUM_VIEWPORTS, &viewports[0]);
+            vk.cmd_set_scissor(command_buffer, 0, NUM_VIEWPORTS, &scissors[0]);
+
+            vk.cmd_bind_pipeline(command_buffer, vk.Pipeline_Bind_Point.Graphics, graphics_pipeline);
 
             {
                 vertex_buffers := [1]vk.Buffer { vertex_buffer };
                 offsets := [1]vk.Device_Size {0};
-                vk.cmd_bind_vertex_buffers(command_buffers[i], 0, 1, &vertex_buffers[0], &offsets[0]);
-                vk.cmd_bind_index_buffer(command_buffers[i], index_buffer, 0, vk.Index_Type.Uint32); // TODO: make a compile-time func to select Uint32 or Uint16
+                vk.cmd_bind_vertex_buffers(command_buffer, 0, 1, &vertex_buffers[0], &offsets[0]);
+                vk.cmd_bind_index_buffer(command_buffer, index_buffer, 0, vk.Index_Type.Uint32); // TODO: make a compile-time func to select Uint32 or Uint16
             }
 
-            vk.cmd_bind_descriptor_sets(command_buffers[i], vk.Pipeline_Bind_Point.Graphics, pipeline_layout, 0, 1, &descriptor_sets[i], 0, nil);
-            vk.cmd_draw_indexed(command_buffers[i], u32(len(indices)), 1, 0, 0, 0);
-            vk.cmd_end_render_pass(command_buffers[i]);
-            check_vk_success(vk.end_command_buffer(command_buffers[i]), "Failed to record command buffer.");
+            vk.cmd_bind_descriptor_sets(command_buffer, vk.Pipeline_Bind_Point.Graphics, pipeline_layout, 0, 1, &descriptor_sets[i], 0, nil);
+            vk.cmd_draw_indexed(command_buffer, u32(len(indices)), 1, 0, 0, 0);
         }
     }
 
@@ -1384,7 +1388,7 @@ run :: proc() -> int {
 
     if (VALIDATION_LAYERS_ENABLED) {
         instance_create_info.enabled_layer_count = u32(len(validation_layers));
-        instance_create_info.enabled_layer_names = cast(^cstring)(&validation_layers[0]);
+        instance_create_info.enabled_layer_names = &validation_layers[0];
     } else {
         instance_create_info.enabled_layer_count = 0;
     }
@@ -1455,7 +1459,7 @@ run :: proc() -> int {
             physical_device_name := cstring(&physical_device_properties.device_name[0]);
             if !found_physical_device && is_device_suitable(devices[i], surface) {
                 physical_device = devices[i];
-                msaa_samples = get_max_usable_sample_count(physical_device_properties);
+                msaa_samples = vk_util.get_max_usable_sample_count(physical_device_properties);
                 max_push_constants_size = physical_device_properties.limits.max_push_constants_size;
                 found_physical_device = true;
                 fmt.println("device:", physical_device_name, "<-- USING THIS DEVICE");
@@ -1525,14 +1529,9 @@ run :: proc() -> int {
                     queue_priorities = &queue_priority,
                 });
             }
-
         }
 
         // Create the logical device
-        device_features := vk.Physical_Device_Features {
-            sampler_anisotropy = true,
-        };
-
         device_create_info := vk.Device_Create_Info {
             s_type = vk.Structure_Type.Device_Create_Info,
             queue_create_infos = mem.raw_data(queue_create_infos),
@@ -1541,7 +1540,7 @@ run :: proc() -> int {
             enabled_extension_count = u32(len(required_device_extensions)),
             enabled_extension_names = mem.raw_data(required_device_extensions),
 
-            enabled_features = &device_features,
+            enabled_features = &LOGICAL_DEVICE_FEATURES,
         };
 
         if (VALIDATION_LAYERS_ENABLED) {
@@ -1888,7 +1887,9 @@ run :: proc() -> int {
                         proj = perspective_vulkan(45, f32(swapchain_extent.width) / f32(swapchain_extent.height), 0.1, 10.0),
                     };
 
-                    ubo.proj[1][1] *= -1;
+                    VIEWPORT_N :: 0;
+
+                    ubo.proj[VIEWPORT_N][1][1] *= -1;
 
                     {
                         data: rawptr;
