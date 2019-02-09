@@ -1307,6 +1307,7 @@ run :: proc() -> int {
     glfw.set_framebuffer_size_callback(window, framebuffer_resize_callback);
     glfw.set_key_callback(window, key_callback);
     //glfw.set_input_mode(window, glfw.CURSOR, auto_cast glfw.CURSOR_DISABLED);
+    glfw.set_input_mode(window, glfw.STICKY_KEYS, 1);
 
     last_time := glfw.get_time();
 
@@ -1558,7 +1559,6 @@ run :: proc() -> int {
     }
 
     vk.get_device_queue(device, graphics_family_index, 0, &graphics_queue);
-
     vk.get_device_queue(device, present_family_index, 0, &present_queue);
 
     // create command pool
@@ -1835,6 +1835,9 @@ run :: proc() -> int {
     current_frame := 0;
     start_time := glfw.get_time();
 
+    camera_pos := math.Vec3{2, 2, 2};
+    look_at_target := math.Vec3{0, 0, 0};
+
     for !glfw.window_should_close(window) {
         frame_count += 1;
 
@@ -1842,6 +1845,13 @@ run :: proc() -> int {
         delta_time := cast(f32)(current_time - last_time);
 
         glfw.poll_events();
+
+        // update camera pos
+        z_delta:f32 = 0.0;
+        speed:f32 = 2.5;
+        if glfw.get_key(window, glfw.KEY_W) do z_delta -= speed * delta_time;
+        if glfw.get_key(window, glfw.KEY_S) do z_delta += speed * delta_time;
+        if z_delta > 0 || z_delta < 0 do camera_pos.y += z_delta;
 
         // Draw Frame
         {
@@ -1883,7 +1893,7 @@ run :: proc() -> int {
 
                     ubo := Uniform_Buffer_Object {
                         model = mat4_rotate(Vec3{0, 0, 1}, to_radians(90) * f32(time_since_start)),
-                        view = look_at(Vec3{2, 2, 2}, Vec3{0, 0, 0}, Vec3{0, 0, 1}),
+                        view = look_at(camera_pos, look_at_target, Vec3{0, 0, 1}),
                         proj = perspective_vulkan(45, f32(swapchain_extent.width) / f32(swapchain_extent.height), 0.1, 10.0),
                     };
 
